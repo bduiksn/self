@@ -9,8 +9,8 @@ import logging
 import traceback
 import secrets
 import hashlib
-import base64
 from pathlib import Path
+import base64
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
@@ -67,7 +67,6 @@ from pyrogram.errors import (
 
 
 APP_NAME = "HusteRIX"
-
 DB_PATH = "husterix.sqlite3"
 LOG_PATH = "husterix_errors.log"
 
@@ -76,7 +75,6 @@ API_ID = 32955870
 API_HASH = "a40ba705a967c3c8e490f4684f42256a"
 
 BOT_USERNAME = ""
-
 CARD_NUMBER = "5022291579049451"
 CARD_OWNER = "علی محمدی پور"
 
@@ -90,7 +88,6 @@ GOD_ADMIN_IDS = {
 }
 
 TEHRAN = ZoneInfo("Asia/Tehran")
-
 MAX_REPEAT = 20
 MAX_DELETE = 100
 ENEMY_REPLY_LIMIT = 50
@@ -98,15 +95,7 @@ SECRETARY_COOLDOWN = 300
 BILLING_INTERVAL = 3600
 ANTI_LOGIN_INTERVAL = 60
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing")
-if not API_ID or not API_HASH:
-    raise RuntimeError("API_ID/API_HASH are missing")
-if not GOD_ADMIN_IDS:
-    raise RuntimeError("GOD_ADMIN_IDS is missing")
-if not CARD_NUMBER or not CARD_OWNER:
-    raise RuntimeError("CARD_NUMBER/CARD_OWNER are missing")
-
+Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 Path(LOG_PATH).parent.mkdir(parents=True, exist_ok=True)
 
@@ -706,24 +695,30 @@ class DB:
 
 class SecretStore:
     def __init__(self):
-        key = os.getenv("SESSION_ENCRYPTION_KEY", "").strip()
-        if not key:
-            raise RuntimeError("SESSION_ENCRYPTION_KEY is missing")
+        # SESSION_ENCRYPTION_KEY is optional. If Railway does not provide it,
+        # create and persist a Fernet key locally so startup never depends on
+        # a manually-created environment variable.
+        env_key = os.getenv("SESSION_ENCRYPTION_KEY", "").strip()
 
-        # Accept a normal Fernet key. If Railway provides a generated
-        # 32-character secret, deterministically derive a valid Fernet key.
+        key_file = Path(DB_PATH).with_name(".husterix_session_key")
+        key_file.parent.mkdir(parents=True, exist_ok=True)
+
+        if env_key:
+            key = env_key.encode("utf-8")
+        elif key_file.exists():
+            key = key_file.read_bytes().strip()
+        else:
+            key = Fernet.generate_key()
+            tmp_file = key_file.with_suffix(".tmp")
+            tmp_file.write_bytes(key)
+            tmp_file.replace(key_file)
+
         try:
-            self.fernet = Fernet(key.encode())
-        except Exception:
-            derived_key = base64.urlsafe_b64encode(
-                hashlib.sha256(key.encode("utf-8")).digest()
-            )
-            try:
-                self.fernet = Fernet(derived_key)
-            except Exception as exc:
-                raise RuntimeError(
-                    "SESSION_ENCRYPTION_KEY could not be converted to a valid Fernet key"
-                ) from exc
+            self.fernet = Fernet(key)
+        except Exception as exc:
+            raise RuntimeError(
+                "SESSION_ENCRYPTION_KEY is invalid"
+            ) from exc
 
     def encrypt(self, value):
         return self.fernet.encrypt(value.encode()).decode()
