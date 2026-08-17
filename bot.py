@@ -104,6 +104,114 @@ TEHRAN_OFFSET_HOURS = 3.5
 # Logging
 # ============================================================
 
+# ============================================================
+# Persistent error logging
+# ============================================================
+ERROR_LOG_FILE = os.getenv("ERROR_LOG_FILE", "husterix_errors.log")
+
+def write_detailed_error(title: str, exc: Exception):
+    """Write a detailed, human-readable traceback to the persistent error log."""
+    try:
+        with open(ERROR_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write("\n" + "=" * 72 + "\n")
+            f.write(f"TIME: {datetime.now().isoformat(timespec='seconds')}\n")
+            f.write(f"TITLE: {title}\n")
+            f.write(f"TYPE: {type(exc).__name__}\n")
+            f.write(f"MESSAGE: {exc}\n")
+            f.write("TRACEBACK:\n")
+            f.write(traceback.format_exc())
+            f.write("=" * 72 + "\n")
+    except Exception as e:
+        write_detailed_error("Unhandled exception", e)
+
+
+def get_error_log_text(lines: int = 80) -> str:
+    """Return the latest error log lines safely."""
+    try:
+        if not os.path.exists(ERROR_LOG_FILE):
+            return "✅ هنوز هیچ خطایی در لاگ ثبت نشده."
+        with open(ERROR_LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+            data = f.readlines()
+        if not data:
+            return "✅ هنوز هیچ خطایی در لاگ ثبت نشده."
+        return "".join(data[-lines:])
+    except Exception as exc:
+        return f"❌ خطا در خواندن فایل لاگ: {exc}"
+
+
+def clear_error_log():
+    try:
+        with open(ERROR_LOG_FILE, "w", encoding="utf-8") as f:
+            f.write(
+                f"HusteRIX Error Log\n"
+                f"Cleared: {datetime.now().isoformat(timespec='seconds')}\n"
+            )
+        return True
+    except Exception:
+        return False
+
+
+
+class FlushFileHandler(logging.FileHandler):
+    def emit(self, record):
+        super().emit(record)
+        try:
+            self.flush()
+        except Exception:
+            pass
+
+_file_handler = FlushFileHandler(ERROR_LOG_FILE, encoding="utf-8")
+_file_handler.setLevel(logging.ERROR)
+_file_handler.setFormatter(logging.Formatter(
+    "[%(asctime)s] %(levelname)s - %(name)s - %(message)s"
+))
+
+_root_logger = logging.getLogger()
+_root_logger.addHandler(_file_handler)
+
+def install_global_exception_logging():
+    import sys
+    def handle_exception(exc_type, exc_value, exc_traceback):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_traceback)
+            return
+        logging.getLogger("HusteRIX").critical(
+            "UNHANDLED EXCEPTION",
+            exc_info=(exc_type, exc_value, exc_traceback)
+        )
+        try:
+            with open(ERROR_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write("\n" + "=" * 72 + "\n")
+                f.write(f"TIME: {datetime.now().isoformat(timespec='seconds')}\n")
+                f.write("TITLE: UNHANDLED EXCEPTION\n")
+                f.write(f"TYPE: {exc_type.__name__}\n")
+                f.write(f"MESSAGE: {exc_value}\n")
+                f.write("TRACEBACK:\n")
+                f.write("".join(traceback.format_exception(exc_type, exc_value, exc_traceback)))
+                f.write("=" * 72 + "\n")
+        except Exception:
+            pass
+    sys.excepthook = handle_exception
+
+    try:
+        loop = asyncio.get_event_loop()
+        def loop_exception_handler(loop, context):
+            exc = context.get("exception")
+            if exc:
+                logging.getLogger("HusteRIX").critical(
+                    "ASYNCIO UNHANDLED EXCEPTION",
+                    exc_info=(type(exc), exc, exc.__traceback__)
+                )
+            else:
+                logging.getLogger("HusteRIX").critical(
+                    "ASYNCIO ERROR: %s", context.get("message", context)
+                )
+        loop.set_exception_handler(loop_exception_handler)
+    except Exception:
+        logging.exception("Could not install asyncio exception handler")
+
+install_global_exception_logging()
+
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] %(levelname)s - %(message)s"
@@ -885,8 +993,8 @@ async def charge_loop():
 async def safe_send(client: Client, chat_id, text: str):
     try:
         await client.send_message(chat_id, text)
-    except Exception:
-        pass
+    except Exception as e:
+        write_detailed_error("Unhandled exception", e)
 
 
 async def stop_userbot(user_id: int):
@@ -901,8 +1009,8 @@ async def stop_userbot(user_id: int):
 
     try:
         await client.stop()
-    except Exception:
-        pass
+    except Exception as e:
+        write_detailed_error("Unhandled exception", e)
 
     db.stop_subscription(user_id)
 
@@ -1792,16 +1900,16 @@ async def approve_payment_callback(client, callback):
             f"💎 +{format_number(diamonds)} الماس\n"
             f"💰 موجودی جدید: {format_diamonds(new_balance)} 💎",
         )
-    except Exception:
-        pass
+    except Exception as e:
+        write_detailed_error("Unhandled exception", e)
 
     try:
         await callback.message.edit_caption(
             callback.message.caption
             + "\n\n✅ **تأیید شد**"
         )
-    except Exception:
-        pass
+    except Exception as e:
+        write_detailed_error("Unhandled exception", e)
 
     await callback.answer("پرداخت تأیید شد.")
 
@@ -1836,16 +1944,16 @@ async def reject_payment_callback(client, callback):
             "لطفاً مبلغ و اطلاعات فیش را بررسی کرده و "
             "در صورت نیاز یک درخواست جدید ایجاد کن.",
         )
-    except Exception:
-        pass
+    except Exception as e:
+        write_detailed_error("Unhandled exception", e)
 
     try:
         await callback.message.edit_caption(
             callback.message.caption
             + "\n\n❌ **رد شد**"
         )
-    except Exception:
-        pass
+    except Exception as e:
+        write_detailed_error("Unhandled exception", e)
 
     await callback.answer("پرداخت رد شد.")
 
@@ -2206,6 +2314,8 @@ async def main():
 
 
 if __name__ == "__main__":
+    logging.info("HusteRIX process starting...")
+
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
