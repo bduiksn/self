@@ -71,9 +71,9 @@ APP_NAME = "HusteRIX"
 DB_PATH = "husterix.sqlite3"
 LOG_PATH = "husterix_errors.log"
 
-BOT_TOKEN = "8432783132:AAHaNXKf_JQNQ8maiV_y2fF_efVUOVZiB2A"
-API_ID = 32955870
-API_HASH = "a40ba705a967c3c8e490f4684f42256a"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+API_ID = int(os.getenv("API_ID", "0") or 0)
+API_HASH = os.getenv("API_HASH", "").strip()
 
 BOT_USERNAME = ""
 CARD_NUMBER = "5022291579049451"
@@ -96,7 +96,6 @@ SECRETARY_COOLDOWN = 300
 BILLING_INTERVAL = 3600
 ANTI_LOGIN_INTERVAL = 60
 
-Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 Path(LOG_PATH).parent.mkdir(parents=True, exist_ok=True)
 
@@ -750,86 +749,27 @@ class SecretStore:
 db = DB(DB_PATH)
 secret_store = SecretStore()
 # ============================================================
-# DEBUG V2 - TRACE PYROGRAM HANDLER REGISTRATION
+# HusteRIX DEBUG / STABLE HANDLER REGISTRATION
 # ============================================================
-# This is intentionally enabled for diagnosis only. It traces every
-# Client.add_handler()/on_message()/on_callback_query() registration so
-# we can see whether decorators actually register handlers on the manager.
-DEBUG_TRACE_REGISTRATION = True
+# IMPORTANT: handlers are registered explicitly with add_handler().
+# This avoids relying on decorator registration behavior and makes the
+# Dispatcher state deterministic and directly auditable.
+from pyrogram.handlers import MessageHandler, CallbackQueryHandler
 
-_ORIGINAL_ADD_HANDLER = Client.add_handler
-_ORIGINAL_ON_MESSAGE = Client.on_message
-_ORIGINAL_ON_CALLBACK_QUERY = Client.on_callback_query
+DEBUG_TRACE_REGISTRATION = True
 
 def _trace_client_name(client):
     return getattr(client, "name", "<unknown-client>")
 
-def _debug_add_handler(self, *args, **kwargs):
+def debug_audit_client(client, stage):
     try:
-        handler = args[0] if args else kwargs.get("handler")
-        group = args[1] if len(args) > 1 else kwargs.get("group", 0)
-        if DEBUG_TRACE_REGISTRATION:
-            debug_log(
-                "PYROGRAM_ADD_HANDLER_BEGIN",
-                client=_trace_client_name(self),
-                handler_type=type(handler).__name__ if handler is not None else None,
-                group=group,
-                callback=getattr(getattr(handler, "callback", None), "__name__", None),
-            )
-        result = _ORIGINAL_ADD_HANDLER(self, *args, **kwargs)
-        if DEBUG_TRACE_REGISTRATION:
-            groups = getattr(getattr(self, "dispatcher", None), "groups", {})
-            debug_log(
-                "PYROGRAM_ADD_HANDLER_OK",
-                client=_trace_client_name(self),
-                handler_type=type(handler).__name__ if handler is not None else None,
-                group=group,
-                dispatcher_groups=list(groups.keys()),
-                dispatcher_handler_count=sum(len(v) for v in groups.values()),
-            )
-        return result
-    except Exception as exc:
-        logger.exception(
-            "[DEBUG] PYROGRAM_ADD_HANDLER_ERROR | client=%s | error=%s",
-            _trace_client_name(self), exc
-        )
-        raise
-
-def _debug_on_message(self, *args, **kwargs):
-    if DEBUG_TRACE_REGISTRATION:
-        debug_log(
-            "PYROGRAM_ON_MESSAGE_DECORATOR",
-            client=_trace_client_name(self),
-            group=kwargs.get("group", args[1] if len(args) > 1 else 0),
-            filters_type=type(args[0]).__name__ if args else type(kwargs.get("filters")).__name__,
-        )
-    return _ORIGINAL_ON_MESSAGE(self, *args, **kwargs)
-
-def _debug_on_callback_query(self, *args, **kwargs):
-    if DEBUG_TRACE_REGISTRATION:
-        debug_log(
-            "PYROGRAM_ON_CALLBACK_QUERY_DECORATOR",
-            client=_trace_client_name(self),
-            group=kwargs.get("group", args[1] if len(args) > 1 else 0),
-            filters_type=type(args[0]).__name__ if args else type(kwargs.get("filters")).__name__,
-        )
-    return _ORIGINAL_ON_CALLBACK_QUERY(self, *args, **kwargs)
-
-Client.add_handler = _debug_add_handler
-Client.on_message = _debug_on_message
-Client.on_callback_query = _debug_on_callback_query
-
-
-def debug_audit_manager(stage):
-    """Print a detailed snapshot of the manager Dispatcher."""
-    try:
-        dispatcher = getattr(manager, "dispatcher", None)
+        dispatcher = getattr(client, "dispatcher", None)
         groups = getattr(dispatcher, "groups", {}) if dispatcher else {}
         debug_log(
             "HANDLER_AUDIT",
             stage=stage,
-            manager_name=_trace_client_name(manager),
-            manager_type=type(manager).__name__,
+            client_name=_trace_client_name(client),
+            client_type=type(client).__name__,
             dispatcher_type=type(dispatcher).__name__ if dispatcher else None,
             group_ids=list(groups.keys()),
             total_handlers=sum(len(v) for v in groups.values()),
@@ -839,16 +779,27 @@ def debug_audit_manager(stage):
                 callback = getattr(h, "callback", None)
                 debug_log(
                     "HANDLER_AUDIT_ITEM",
-                    stage=stage,
-                    group=gid,
-                    index=index,
+                    stage=stage, group=gid, index=index,
                     handler_type=type(h).__name__,
                     callback=getattr(callback, "__name__", repr(callback)),
-                    module=getattr(callback, "__module__", None),
                 )
     except Exception as exc:
-        logger.exception("[DEBUG] HANDLER_AUDIT_ERROR | stage=%s | %s", stage, exc)
+        logger.exception("[DEBUG] HANDLER_AUDIT_ERROR | %s", exc)
 
+def _register_manager_handler(handler, group, name):
+    try:
+        if DEBUG_TRACE_REGISTRATION:
+            debug_log("HANDLER_REGISTER_BEGIN", name=name, handler_type=type(handler).__name__, group=group)
+        manager.add_handler(handler, group)
+        if DEBUG_TRACE_REGISTRATION:
+            debug_log("HANDLER_REGISTER_OK", name=name, group=group)
+    except Exception as exc:
+        logger.exception("[DEBUG] HANDLER_REGISTER_ERROR | name=%s | group=%s | %s", name, group, exc)
+        raise
+
+
+if not BOT_TOKEN or not API_ID or not API_HASH:
+    raise RuntimeError("BOT_TOKEN, API_ID and API_HASH must be set in environment variables")
 
 manager = Client(
     "husterix_manager",
@@ -983,7 +934,6 @@ async def home_message(message):
     await message.reply_text(text, reply_markup=user_menu())
 
 
-@manager.on_message(filters.private, group=-1000)
 async def debug_incoming_message(client, message):
     # Temporary first-line diagnostic handler.
     # It never replies, edits, deletes, or stops propagation.
@@ -1010,7 +960,6 @@ async def debug_incoming_message(client, message):
     except Exception as exc:
         logger.exception("[DEBUG] debug_incoming_message failed: %s", exc)
 
-@manager.on_message(filters.private & filters.command("start"), group=-10)
 async def start_handler(client, message):
     uid = message.from_user.id if message.from_user else None
     try:
@@ -1052,14 +1001,12 @@ async def start_handler(client, message):
         await send_error_to_db(exc, "start_handler", uid)
 
 
-@manager.on_message(filters.command("admin"))
 async def admin_cmd(client, message):
     if not is_admin(message.from_user.id):
         return
     await message.reply_text("🛡 <b>HusteRIX Admin</b>", reply_markup=admin_menu())
 
 
-@manager.on_message(filters.command("panel"))
 async def panel_cmd(client, message):
     try:
         await ensure_manager_user(client, message)
@@ -1071,7 +1018,6 @@ async def panel_cmd(client, message):
         await send_error_to_db(exc, "panel_cmd", message.from_user.id)
 
 
-@manager.on_callback_query(filters.regex("^home$"))
 async def home_cb(client, query):
     try:
         await safe_answer(query)
@@ -1083,7 +1029,6 @@ async def home_cb(client, query):
         await send_error_to_db(exc, "home_cb", query.from_user.id)
 
 
-@manager.on_callback_query(filters.regex("^wallet$"))
 async def wallet_cb(client, query):
     try:
         bal = await db.get_wallet(query.from_user.id)
@@ -1100,7 +1045,6 @@ async def wallet_cb(client, query):
         await send_error_to_db(exc, "wallet_cb", query.from_user.id)
 
 
-@manager.on_callback_query(filters.regex("^transactions$"))
 async def transactions_cb(client, query):
     try:
         rows = await db.transactions(query.from_user.id, 15)
@@ -1122,7 +1066,6 @@ async def transactions_cb(client, query):
         await send_error_to_db(exc, "transactions_cb", query.from_user.id)
 
 
-@manager.on_callback_query(filters.regex("^status$"))
 async def status_cb(client, query):
     try:
         user = await db.get_user(query.from_user.id)
@@ -1141,7 +1084,6 @@ async def status_cb(client, query):
         await send_error_to_db(exc, "status_cb", query.from_user.id)
 
 
-@manager.on_callback_query(filters.regex("^help$"))
 async def help_cb(client, query):
     text = (
         "❓ <b>راهنمای HusteRIX</b>\n\n"
@@ -1160,7 +1102,6 @@ async def help_cb(client, query):
     await query.message.edit_text(text, reply_markup=user_menu())
 
 
-@manager.on_callback_query(filters.regex("^referral$"))
 async def referral_cb(client, query):
     username = BOT_USERNAME
     if not username:
@@ -1179,7 +1120,6 @@ async def referral_cb(client, query):
     ]))
 
 
-@manager.on_callback_query(filters.regex("^self_activate$"))
 async def self_activate_cb(client, query):
     try:
         session = await db.get_session(query.from_user.id)
@@ -1198,7 +1138,6 @@ async def self_activate_cb(client, query):
         await send_error_to_db(exc, "self_activate_cb", query.from_user.id)
 
 
-@manager.on_message(filters.private & ~filters.service)
 async def manager_text_flow(client, message):
     uid = message.from_user.id
     try:
@@ -1462,7 +1401,6 @@ async def selfbot_maintenance(user_id, app):
 async def configure_selfbot_handlers(user_id, app):
     # Handlers are installed once when the app is created.
     # Pyrogram permits registering handlers dynamically.
-    @app.on_message(filters.private & ~filters.me)
     async def private_handler(client, message):
         try:
             settings = await db.settings(user_id)
@@ -1530,7 +1468,6 @@ async def configure_selfbot_handlers(user_id, app):
         except Exception as exc:
             await send_error_to_db(exc, "selfbot_private_handler", user_id)
 
-    @app.on_message(filters.me)
     async def outgoing_handler(client, message):
         try:
             settings = await db.settings(user_id)
@@ -1627,6 +1564,16 @@ async def configure_selfbot_handlers(user_id, app):
             await send_error_to_db(exc, "selfbot_outgoing_handler", user_id)
 
 
+    # Explicit registration: do not rely on decorators.
+    app.add_handler(MessageHandler(private_handler, filters.private & ~filters.me), group=0)
+    app.add_handler(MessageHandler(outgoing_handler, filters.me), group=1)
+    debug_log(
+        "SELF_HANDLER_REGISTERED",
+        user_id=user_id,
+        handlers=["private_handler", "outgoing_handler"],
+    )
+
+
 async def copy_identity(user_id, app, target_id):
     settings = await db.settings(user_id)
     me = await app.get_me()
@@ -1697,7 +1644,6 @@ async def translate_text(text, lang):
         return None
 
 
-@manager.on_callback_query(filters.regex("^self_panel(?:_refresh)?$"))
 async def self_panel_cb(client, query):
     try:
         settings = await db.settings(query.from_user.id)
@@ -1713,7 +1659,6 @@ async def self_panel_cb(client, query):
         await send_error_to_db(exc, "self_panel_cb", query.from_user.id)
 
 
-@manager.on_callback_query(filters.regex("^toggle:"))
 async def toggle_cb(client, query):
     try:
         field = query.data.split(":", 1)[1]
@@ -1736,7 +1681,6 @@ async def toggle_cb(client, query):
         await send_error_to_db(exc, "toggle_cb", query.from_user.id)
 
 
-@manager.on_callback_query(filters.regex("^fonts$"))
 async def fonts_cb(client, query):
     buttons = []
     names = list(FONT_MAP.keys())
@@ -1751,7 +1695,6 @@ async def fonts_cb(client, query):
     await query.message.edit_text("🔤 <b>Clock Font</b>", reply_markup=InlineKeyboardMarkup(buttons))
 
 
-@manager.on_callback_query(filters.regex("^font:"))
 async def font_cb(client, query):
     font = query.data.split(":", 1)[1]
     if font not in FONT_MAP:
@@ -1761,7 +1704,6 @@ async def font_cb(client, query):
     await self_panel_cb(client, query)
 
 
-@manager.on_callback_query(filters.regex("^translation$"))
 async def translation_cb(client, query):
     await safe_answer(query)
     await query.message.edit_text(
@@ -1775,7 +1717,6 @@ async def translation_cb(client, query):
     )
 
 
-@manager.on_callback_query(filters.regex("^lang:"))
 async def lang_cb(client, query):
     lang = query.data.split(":", 1)[1]
     settings = await db.settings(query.from_user.id)
@@ -1785,7 +1726,6 @@ async def lang_cb(client, query):
     await self_panel_cb(client, query)
 
 
-@manager.on_callback_query(filters.regex("^enemy_list$"))
 async def enemy_list_cb(client, query):
     rows = await db.list_enemies(query.from_user.id)
     text = "⚔️ <b>Enemy List</b>\n\n"
@@ -1796,7 +1736,6 @@ async def enemy_list_cb(client, query):
     ]))
 
 
-@manager.on_callback_query(filters.regex("^copy_info$"))
 async def copy_info_cb(client, query):
     await safe_answer(query)
     await query.message.edit_text(
@@ -1807,7 +1746,6 @@ async def copy_info_cb(client, query):
     )
 
 
-@manager.on_callback_query(filters.regex("^buy$"))
 async def buy_cb(client, query):
     purchase_states[query.from_user.id] = {"value": ""}
     await safe_answer(query)
@@ -1844,7 +1782,6 @@ def calculator_keyboard(value):
     ])
 
 
-@manager.on_callback_query(filters.regex("^calc:"))
 async def calc_cb(client, query):
     uid = query.from_user.id
     state = purchase_states.setdefault(uid, {"value": ""})
@@ -1889,14 +1826,12 @@ async def calc_cb(client, query):
     )
 
 
-@manager.on_callback_query(filters.regex("^buy_cancel$"))
 async def buy_cancel_cb(client, query):
     purchase_states.pop(query.from_user.id, None)
     await safe_answer(query)
     await query.message.edit_text("❌ خرید لغو شد.", reply_markup=user_menu())
 
 
-@manager.on_message(filters.private & filters.photo)
 async def receipt_handler(client, message):
     uid = message.from_user.id
     state = purchase_states.get(uid)
@@ -1940,7 +1875,6 @@ async def receipt_handler(client, message):
         await message.reply_text("❌ ثبت فیش ناموفق بود.")
 
 
-@manager.on_callback_query(filters.regex("^pay(approve|reject):"))
 async def payment_review_cb(client, query):
     if not is_admin(query.from_user.id):
         await safe_answer(query, "دسترسی ندارید.", True)
@@ -1977,7 +1911,6 @@ async def payment_review_cb(client, query):
         await safe_answer(query, "خطا در بررسی پرداخت.", True)
 
 
-@manager.on_callback_query(filters.regex("^admin_stats$"))
 async def admin_stats_cb(client, query):
     if not is_admin(query.from_user.id):
         return
@@ -2000,7 +1933,6 @@ async def admin_stats_cb(client, query):
         await send_error_to_db(exc, "admin_stats_cb", query.from_user.id)
 
 
-@manager.on_callback_query(filters.regex("^admin_sessions$"))
 async def admin_sessions_cb(client, query):
     if not is_admin(query.from_user.id):
         return
@@ -2022,7 +1954,6 @@ async def admin_sessions_cb(client, query):
         await send_error_to_db(exc, "admin_sessions_cb", query.from_user.id)
 
 
-@manager.on_callback_query(filters.regex("^admin_users$"))
 async def admin_users_cb(client, query):
     if not is_admin(query.from_user.id):
         return
@@ -2037,7 +1968,6 @@ async def admin_users_cb(client, query):
         await send_error_to_db(exc, "admin_users_cb", query.from_user.id)
 
 
-@manager.on_callback_query(filters.regex("^admin_home$"))
 async def admin_home_cb(client, query):
     if not is_admin(query.from_user.id):
         return
@@ -2045,7 +1975,6 @@ async def admin_home_cb(client, query):
     await query.message.edit_text("🛡 <b>HusteRIX Admin</b>", reply_markup=admin_menu())
 
 
-@manager.on_callback_query(filters.regex("^admin_logs$"))
 async def admin_logs_cb(client, query):
     if not is_admin(query.from_user.id):
         return
@@ -2070,7 +1999,6 @@ async def admin_logs_cb(client, query):
         await send_error_to_db(exc, "admin_logs_cb", query.from_user.id)
 
 
-@manager.on_callback_query(filters.regex("^admin_clear_logs$"))
 async def admin_clear_logs_cb(client, query):
     if not is_admin(query.from_user.id):
         return
@@ -2080,7 +2008,6 @@ async def admin_clear_logs_cb(client, query):
     await admin_logs_cb(client, query)
 
 
-@manager.on_callback_query(filters.regex("^admin_ban$"))
 async def admin_ban_cb(client, query):
     if not is_admin(query.from_user.id):
         return
@@ -2092,7 +2019,6 @@ async def admin_ban_cb(client, query):
     )
 
 
-@manager.on_message(filters.command("unban"))
 async def unban_cmd(client, message):
     if not is_admin(message.from_user.id):
         return
@@ -2105,7 +2031,6 @@ async def unban_cmd(client, message):
         await message.reply_text("✅ Unban شد.")
 
 
-@manager.on_callback_query(filters.regex("^admin_remove_session$"))
 async def admin_remove_session_cb(client, query):
     if not is_admin(query.from_user.id):
         return
@@ -2114,7 +2039,6 @@ async def admin_remove_session_cb(client, query):
     await query.message.edit_text("🗑 User ID مربوط به Session را ارسال کنید.")
 
 
-@manager.on_callback_query(filters.regex("^admin_wallet$"))
 async def admin_wallet_cb(client, query):
     if not is_admin(query.from_user.id):
         return
@@ -2127,7 +2051,6 @@ async def admin_wallet_cb(client, query):
     )
 
 
-@manager.on_callback_query(filters.regex("^admin_broadcast$"))
 async def admin_broadcast_cb(client, query):
     if not is_admin(query.from_user.id):
         return
@@ -2136,7 +2059,6 @@ async def admin_broadcast_cb(client, query):
     await query.message.edit_text("📢 متن Broadcast را ارسال کنید.")
 
 
-@manager.on_callback_query(filters.regex("^admin_payments$"))
 async def admin_payments_cb(client, query):
     if not is_admin(query.from_user.id):
         return
@@ -2273,13 +2195,11 @@ async def session_bootstrap():
             await send_error_to_db(exc, "session_bootstrap", row["user_id"], row["session_id"])
 
 
-@manager.on_message(filters.command("adminpanel"))
 async def adminpanel_cmd(client, message):
     if is_admin(message.from_user.id):
         await message.reply_text("🛡 <b>Admin Panel</b>", reply_markup=admin_menu())
 
 
-@manager.on_message(filters.command("stopself"))
 async def stopself_cmd(client, message):
     if not is_admin(message.from_user.id):
         return
@@ -2292,7 +2212,6 @@ async def stopself_cmd(client, message):
         await message.reply_text("⏹ Session متوقف شد.")
 
 
-@manager.on_message(filters.command("startself"))
 async def startself_cmd(client, message):
     if not is_admin(message.from_user.id):
         return
@@ -2304,6 +2223,57 @@ async def startself_cmd(client, message):
         # start_selfbot registers the handlers itself.
         await db.admin_log(message.from_user.id, "START_SESSION", uid)
         await message.reply_text("▶️ Session اجرا شد." if ok else "❌ اجرا نشد.")
+
+
+def register_manager_handlers():
+    """Register every manager handler explicitly and audit the result."""
+    registrations = [
+        (MessageHandler(debug_incoming_message, filters.private), -1000, "debug_incoming_message"),
+        (MessageHandler(start_handler, filters.private & filters.command("start")), -10, "start_handler"),
+        (MessageHandler(admin_cmd, filters.command("admin")), 0, "admin_cmd"),
+        (MessageHandler(panel_cmd, filters.command("panel")), 0, "panel_cmd"),
+        (CallbackQueryHandler(home_cb, filters.regex("^home$")), 0, "home_cb"),
+        (CallbackQueryHandler(wallet_cb, filters.regex("^wallet$")), 0, "wallet_cb"),
+        (CallbackQueryHandler(transactions_cb, filters.regex("^transactions$")), 0, "transactions_cb"),
+        (CallbackQueryHandler(status_cb, filters.regex("^status$")), 0, "status_cb"),
+        (CallbackQueryHandler(help_cb, filters.regex("^help$")), 0, "help_cb"),
+        (CallbackQueryHandler(referral_cb, filters.regex("^referral$")), 0, "referral_cb"),
+        (CallbackQueryHandler(self_activate_cb, filters.regex("^self_activate$")), 0, "self_activate_cb"),
+        (MessageHandler(manager_text_flow, filters.private & ~filters.service), 0, "manager_text_flow"),
+        (CallbackQueryHandler(self_panel_cb, filters.regex("^self_panel(?:_refresh)?$")), 0, "self_panel_cb"),
+        (CallbackQueryHandler(toggle_cb, filters.regex("^toggle:")), 0, "toggle_cb"),
+        (CallbackQueryHandler(fonts_cb, filters.regex("^fonts$")), 0, "fonts_cb"),
+        (CallbackQueryHandler(font_cb, filters.regex("^font:")), 0, "font_cb"),
+        (CallbackQueryHandler(translation_cb, filters.regex("^translation$")), 0, "translation_cb"),
+        (CallbackQueryHandler(lang_cb, filters.regex("^lang:")), 0, "lang_cb"),
+        (CallbackQueryHandler(enemy_list_cb, filters.regex("^enemy_list$")), 0, "enemy_list_cb"),
+        (CallbackQueryHandler(copy_info_cb, filters.regex("^copy_info$")), 0, "copy_info_cb"),
+        (CallbackQueryHandler(buy_cb, filters.regex("^buy$")), 0, "buy_cb"),
+        (CallbackQueryHandler(calc_cb, filters.regex("^calc:")), 0, "calc_cb"),
+        (CallbackQueryHandler(buy_cancel_cb, filters.regex("^buy_cancel$")), 0, "buy_cancel_cb"),
+        (MessageHandler(receipt_handler, filters.private & filters.photo), 0, "receipt_handler"),
+        (CallbackQueryHandler(payment_review_cb, filters.regex("^pay(approve|reject):")), 0, "payment_review_cb"),
+        (CallbackQueryHandler(admin_stats_cb, filters.regex("^admin_stats$")), 0, "admin_stats_cb"),
+        (CallbackQueryHandler(admin_sessions_cb, filters.regex("^admin_sessions$")), 0, "admin_sessions_cb"),
+        (CallbackQueryHandler(admin_users_cb, filters.regex("^admin_users$")), 0, "admin_users_cb"),
+        (CallbackQueryHandler(admin_home_cb, filters.regex("^admin_home$")), 0, "admin_home_cb"),
+        (CallbackQueryHandler(admin_logs_cb, filters.regex("^admin_logs$")), 0, "admin_logs_cb"),
+        (CallbackQueryHandler(admin_clear_logs_cb, filters.regex("^admin_clear_logs$")), 0, "admin_clear_logs_cb"),
+        (CallbackQueryHandler(admin_ban_cb, filters.regex("^admin_ban$")), 0, "admin_ban_cb"),
+        (MessageHandler(unban_cmd, filters.command("unban")), 0, "unban_cmd"),
+        (CallbackQueryHandler(admin_remove_session_cb, filters.regex("^admin_remove_session$")), 0, "admin_remove_session_cb"),
+        (CallbackQueryHandler(admin_wallet_cb, filters.regex("^admin_wallet$")), 0, "admin_wallet_cb"),
+        (CallbackQueryHandler(admin_broadcast_cb, filters.regex("^admin_broadcast$")), 0, "admin_broadcast_cb"),
+        (CallbackQueryHandler(admin_payments_cb, filters.regex("^admin_payments$")), 0, "admin_payments_cb"),
+        (MessageHandler(adminpanel_cmd, filters.command("adminpanel")), 0, "adminpanel_cmd"),
+        (MessageHandler(stopself_cmd, filters.command("stopself")), 0, "stopself_cmd"),
+        (MessageHandler(startself_cmd, filters.command("startself")), 0, "startself_cmd"),
+    ]
+    debug_log("HANDLER_REGISTRATION_BEGIN", expected=len(registrations))
+    for handler, group, name in registrations:
+        _register_manager_handler(handler, group, name)
+    debug_audit_client(manager, "AFTER_EXPLICIT_REGISTRATION")
+    return len(registrations)
 
 
 async def shutdown():
@@ -2331,11 +2301,14 @@ async def main():
     loop.set_exception_handler(_loop_exception_handler)
     await db.init()
     logger.info("Initializing HusteRIX manager bot...")
-    debug_audit_manager("BEFORE_MANAGER_START")
+    debug_log("BOOT_STEP", step="register_manager_handlers", status="BEGIN")
+    register_manager_handlers()
+    debug_log("BOOT_STEP_OK", step="register_manager_handlers", status="DONE")
+    debug_audit_client(manager, "BEFORE_MANAGER_START")
     debug_log("BOOT_STEP", step="manager.start", status="BEGIN")
     await manager.start()
     debug_log("BOOT_STEP_OK", step="manager.start", status="DONE")
-    debug_audit_manager("AFTER_MANAGER_START")
+    debug_audit_client(manager, "AFTER_MANAGER_START")
     me = await manager.get_me()
     global BOT_USERNAME
     BOT_USERNAME = BOT_USERNAME or (me.username or "")
@@ -2344,16 +2317,17 @@ async def main():
         raise RuntimeError("Manager client authenticated, but the account is not a bot")
 
     logger.info("Manager connection established as @%s", me.username or me.id)
-    handler_count = sum(len(g) for g in manager.dispatcher.groups.values())
+    handler_groups = getattr(getattr(manager, "dispatcher", None), "groups", {})
+    handler_count = sum(len(g) for g in handler_groups.values())
     logger.info("Manager message handlers registered: %d", handler_count)
     debug_log(
         "DISPATCHER_READY",
         handler_count=handler_count,
-        groups=sorted(manager.dispatcher.groups.keys()),
+        groups=sorted(handler_groups.keys()),
         bot_username=me.username,
         bot_id=me.id,
     )
-    for group_id, group_handlers in sorted(manager.dispatcher.groups.items(), key=lambda x: x[0]):
+    for group_id, group_handlers in sorted(handler_groups.items(), key=lambda x: x[0]):
         debug_log(
             "HANDLER_GROUP",
             group=group_id,
