@@ -749,6 +749,107 @@ class SecretStore:
 
 db = DB(DB_PATH)
 secret_store = SecretStore()
+# ============================================================
+# DEBUG V2 - TRACE PYROGRAM HANDLER REGISTRATION
+# ============================================================
+# This is intentionally enabled for diagnosis only. It traces every
+# Client.add_handler()/on_message()/on_callback_query() registration so
+# we can see whether decorators actually register handlers on the manager.
+DEBUG_TRACE_REGISTRATION = True
+
+_ORIGINAL_ADD_HANDLER = Client.add_handler
+_ORIGINAL_ON_MESSAGE = Client.on_message
+_ORIGINAL_ON_CALLBACK_QUERY = Client.on_callback_query
+
+def _trace_client_name(client):
+    return getattr(client, "name", "<unknown-client>")
+
+def _debug_add_handler(self, *args, **kwargs):
+    try:
+        handler = args[0] if args else kwargs.get("handler")
+        group = args[1] if len(args) > 1 else kwargs.get("group", 0)
+        if DEBUG_TRACE_REGISTRATION:
+            debug_log(
+                "PYROGRAM_ADD_HANDLER_BEGIN",
+                client=_trace_client_name(self),
+                handler_type=type(handler).__name__ if handler is not None else None,
+                group=group,
+                callback=getattr(getattr(handler, "callback", None), "__name__", None),
+            )
+        result = _ORIGINAL_ADD_HANDLER(self, *args, **kwargs)
+        if DEBUG_TRACE_REGISTRATION:
+            groups = getattr(getattr(self, "dispatcher", None), "groups", {})
+            debug_log(
+                "PYROGRAM_ADD_HANDLER_OK",
+                client=_trace_client_name(self),
+                handler_type=type(handler).__name__ if handler is not None else None,
+                group=group,
+                dispatcher_groups=list(groups.keys()),
+                dispatcher_handler_count=sum(len(v) for v in groups.values()),
+            )
+        return result
+    except Exception as exc:
+        logger.exception(
+            "[DEBUG] PYROGRAM_ADD_HANDLER_ERROR | client=%s | error=%s",
+            _trace_client_name(self), exc
+        )
+        raise
+
+def _debug_on_message(self, *args, **kwargs):
+    if DEBUG_TRACE_REGISTRATION:
+        debug_log(
+            "PYROGRAM_ON_MESSAGE_DECORATOR",
+            client=_trace_client_name(self),
+            group=kwargs.get("group", args[1] if len(args) > 1 else 0),
+            filters_type=type(args[0]).__name__ if args else type(kwargs.get("filters")).__name__,
+        )
+    return _ORIGINAL_ON_MESSAGE(self, *args, **kwargs)
+
+def _debug_on_callback_query(self, *args, **kwargs):
+    if DEBUG_TRACE_REGISTRATION:
+        debug_log(
+            "PYROGRAM_ON_CALLBACK_QUERY_DECORATOR",
+            client=_trace_client_name(self),
+            group=kwargs.get("group", args[1] if len(args) > 1 else 0),
+            filters_type=type(args[0]).__name__ if args else type(kwargs.get("filters")).__name__,
+        )
+    return _ORIGINAL_ON_CALLBACK_QUERY(self, *args, **kwargs)
+
+Client.add_handler = _debug_add_handler
+Client.on_message = _debug_on_message
+Client.on_callback_query = _debug_on_callback_query
+
+
+def debug_audit_manager(stage):
+    """Print a detailed snapshot of the manager Dispatcher."""
+    try:
+        dispatcher = getattr(manager, "dispatcher", None)
+        groups = getattr(dispatcher, "groups", {}) if dispatcher else {}
+        debug_log(
+            "HANDLER_AUDIT",
+            stage=stage,
+            manager_name=_trace_client_name(manager),
+            manager_type=type(manager).__name__,
+            dispatcher_type=type(dispatcher).__name__ if dispatcher else None,
+            group_ids=list(groups.keys()),
+            total_handlers=sum(len(v) for v in groups.values()),
+        )
+        for gid, handlers in sorted(groups.items(), key=lambda x: x[0]):
+            for index, h in enumerate(handlers):
+                callback = getattr(h, "callback", None)
+                debug_log(
+                    "HANDLER_AUDIT_ITEM",
+                    stage=stage,
+                    group=gid,
+                    index=index,
+                    handler_type=type(h).__name__,
+                    callback=getattr(callback, "__name__", repr(callback)),
+                    module=getattr(callback, "__module__", None),
+                )
+    except Exception as exc:
+        logger.exception("[DEBUG] HANDLER_AUDIT_ERROR | stage=%s | %s", stage, exc)
+
+
 manager = Client(
     "husterix_manager",
     api_id=API_ID,
@@ -756,6 +857,9 @@ manager = Client(
     bot_token=BOT_TOKEN,
     in_memory=True
 )
+
+# NOTE: decorators below are expected to call Client.add_handler.
+# The final audit is performed from main(), after the whole module has loaded.
 
 selfbots = {}
 selfbot_tasks = {}
@@ -2227,9 +2331,11 @@ async def main():
     loop.set_exception_handler(_loop_exception_handler)
     await db.init()
     logger.info("Initializing HusteRIX manager bot...")
+    debug_audit_manager("BEFORE_MANAGER_START")
     debug_log("BOOT_STEP", step="manager.start", status="BEGIN")
     await manager.start()
     debug_log("BOOT_STEP_OK", step="manager.start", status="DONE")
+    debug_audit_manager("AFTER_MANAGER_START")
     me = await manager.get_me()
     global BOT_USERNAME
     BOT_USERNAME = BOT_USERNAME or (me.username or "")
@@ -2257,7 +2363,7 @@ async def main():
     logger.info("HusteRIX started successfully as @%s", me.username or me.id)
     debug_log(
         "READY_FOR_TEST",
-        message="حالا دکمه /start را بزن؛ باید INCOMING_MESSAGE_RECEIVED و بعد START_HANDLER_ENTER را ببینی."
+        message="DEBUG V2: حالا /start را بزن. قبل از آن، لاگ‌های PYROGRAM_* و HANDLER_AUDIT را بررسی کن."
     )
 
     await session_bootstrap()
