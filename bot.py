@@ -9,7 +9,7 @@ import logging
 import traceback
 import secrets
 import hashlib
-from pathlib import Path
+import base64
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
@@ -708,10 +708,21 @@ class SecretStore:
         key = os.getenv("SESSION_ENCRYPTION_KEY", "").strip()
         if not key:
             raise RuntimeError("SESSION_ENCRYPTION_KEY is missing")
+
+        # Accept a normal Fernet key. If Railway provides a generated
+        # 32-character secret, deterministically derive a valid Fernet key.
         try:
             self.fernet = Fernet(key.encode())
-        except Exception as exc:
-            raise RuntimeError("SESSION_ENCRYPTION_KEY is not a valid Fernet key") from exc
+        except Exception:
+            derived_key = base64.urlsafe_b64encode(
+                hashlib.sha256(key.encode("utf-8")).digest()
+            )
+            try:
+                self.fernet = Fernet(derived_key)
+            except Exception as exc:
+                raise RuntimeError(
+                    "SESSION_ENCRYPTION_KEY could not be converted to a valid Fernet key"
+                ) from exc
 
     def encrypt(self, value):
         return self.fernet.encrypt(value.encode()).decode()
