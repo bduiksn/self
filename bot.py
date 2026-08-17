@@ -72,7 +72,7 @@ DB_PATH = "husterix.sqlite3"
 LOG_PATH = "husterix_errors.log"
 
 # HusteRIX Telegram credentials
-BOT_TOKEN = "8432783132:AAHaNXKf_JQNQ8maiV_y2fF_efVUOVZiB2A"
+BOT_TOKEN = "8432783132:AAHx11QHCpe0KK5yRBmoFIdiZEqC2gkGZ4k"
 API_ID = 32955870
 API_HASH = "a40ba705a967c3c8e490f4684f42256a"
 
