@@ -9,6 +9,7 @@ import logging
 import traceback
 import secrets
 import hashlib
+import sys
 from pathlib import Path
 import base64
 from datetime import datetime, timezone
@@ -106,7 +107,12 @@ handler.setFormatter(logging.Formatter(
     "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 ))
 logger.addHandler(handler)
-logger.addHandler(logging.StreamHandler())
+stdout_handler = logging.StreamHandler(sys.stdout)
+stdout_handler.setLevel(logging.INFO)
+stdout_handler.setFormatter(logging.Formatter(
+    "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+))
+logger.addHandler(stdout_handler)
 
 
 def now_iso():
@@ -859,9 +865,10 @@ async def home_message(message):
     await message.reply_text(text, reply_markup=user_menu())
 
 
-@manager.on_message(filters.command("start"))
+@manager.on_message(filters.private & filters.command("start"), group=-10)
 async def start_handler(client, message):
     try:
+        logger.info("Received /start from user_id=%s", message.from_user.id if message.from_user else "-")
         await ensure_manager_user(client, message)
         ref = None
         if len(message.command) > 1:
@@ -1025,6 +1032,8 @@ async def self_activate_cb(client, query):
 async def manager_text_flow(client, message):
     uid = message.from_user.id
     try:
+        if message.text and message.text.startswith("/"):
+            return
         await ensure_manager_user(client, message)
 
         state = login_states.get(uid)
@@ -1189,8 +1198,18 @@ async def start_selfbot(user_id):
             last_seen=now_iso()
         )
         await configure_selfbot_handlers(user_id, app)
-        task = asyncio.create_task(selfbot_maintenance(user_id, app))
+        task = asyncio.create_task(selfbot_maintenance(user_id, app), name=f"selfbot-maintenance-{user_id}")
         selfbot_tasks[user_id] = task
+
+        def _task_done(done_task):
+            try:
+                done_task.result()
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                log_exception("SelfBot maintenance task crashed", user_id=user_id, exc=exc)
+
+        task.add_done_callback(_task_done)
         return True
     except Exception as exc:
         await send_error_to_db(exc, "start_selfbot", user_id, row["session_id"])
@@ -2130,14 +2149,32 @@ async def shutdown():
 
 
 async def main():
+    loop = asyncio.get_running_loop()
+
+    def _loop_exception_handler(loop, context):
+        exc = context.get("exception")
+        if exc is not None:
+            log_exception("Unhandled asyncio exception", exc=exc)
+        else:
+            logger.error("Unhandled asyncio exception | %s", context.get("message", context))
+
+    loop.set_exception_handler(_loop_exception_handler)
     await db.init()
+    logger.info("Initializing HusteRIX manager bot...")
     await manager.start()
     me = await manager.get_me()
     global BOT_USERNAME
     BOT_USERNAME = BOT_USERNAME or (me.username or "")
-    logger.info("%s started as @%s", APP_NAME, me.username)
+
+    if not me or not me.is_bot:
+        raise RuntimeError("Manager client authenticated, but the account is not a bot")
+
+    logger.info("Manager connection established as @%s", me.username or me.id)
+    logger.info("Manager message handlers registered: %d", sum(len(g) for g in manager.dispatcher.groups.values()))
+    logger.info("HusteRIX started successfully as @%s", me.username or me.id)
 
     await session_bootstrap()
+    logger.info("Session bootstrap completed")
 
     try:
         await asyncio.Event().wait()
