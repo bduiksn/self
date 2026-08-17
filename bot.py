@@ -2,41 +2,6 @@
 """
 HusteRIX - Telegram Userbot Manager + Diamond Economy
 =====================================================
-
-Features:
-- Multi-account Telegram userbot login via phone/code/2FA
-- Diamond wallet
-- Card-to-card diamond purchases
-- Inline calculator (0-9, backspace, confirm)
-- Minimum purchase: 500 diamonds
-- Rate: 500 diamonds = 20,000 Toman
-- Admin payment approval/rejection
-- Hourly userbot charge: 2.5 diamonds/hour
-- Referral system: +25 diamonds for a verified Iranian (+98) referral
-- SQLite transaction ledger
-- Basic userbot panel and commands
-- Auto restart of userbot instances
-- Environment-variable secrets
-
-IMPORTANT:
-1) NEVER put BOT_TOKEN/API_HASH in GitHub.
-2) Rotate any token/API credentials that were previously exposed.
-3) Set environment variables before running this file.
-
-Environment variables:
-  API_ID=32955870
-  API_HASH=a40ba705a967c3c8e490f4684f42256a
-  BOT_TOKEN=8432783132:AAFNapmFYrIcRGnHN7Cnp25KZTlUvOSUwZA
-  GOD_ADMIN_IDS=7727625618
-
-Optional:
-  DB_FILE=husterix.sqlite3
-  CARD_NUMBER=5022291579049451
-  CARD_OWNER=علی محمدی پور
-  DIAMOND_MIN=500
-  DIAMOND_PER_500=20000
-  HOURLY_COST=2.5
-  REFERRAL_REWARD=25
 """
 
 import asyncio
@@ -49,6 +14,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
+from aiohttp import web
 from pyrogram import Client, filters, idle
 from pyrogram.enums import ChatType, ChatAction
 from pyrogram.errors import SessionPasswordNeeded, ChatSendInlineForbidden
@@ -71,20 +37,15 @@ from pyrogram import utils as pyrogram_utils
 # Configuration
 # ============================================================
 
-def env_required(name: str) -> str:
-    value = os.getenv(name, "").strip()
-    if not value:
-        raise RuntimeError(f"Environment variable {name} is required.")
-    return value
+API_ID = int(os.getenv("API_ID", "32955870"))
+API_HASH = os.getenv("API_HASH", "a40ba705a967c3c8e490f4684f42256a")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8432783132:AAFNapmFYrIcRGnHN7Cnp25KZTlUvOSUwZA")
 
-
-API_ID = 32955870
-API_HASH = "a40ba705a967c3c8e490f4684f42256a"
-BOT_TOKEN = "8432783132:AAHaNXKf_JQNQ8maiV_y2fF_efVUOVZiB2A"
-
-GOD_ADMIN_IDS = {
-    7727625618
-}
+_admin_env = os.getenv("GOD_ADMIN_IDS", "").strip()
+if _admin_env:
+    GOD_ADMIN_IDS = {int(x.strip()) for x in _admin_env.split(",") if x.strip().isdigit()}
+else:
+    GOD_ADMIN_IDS = {7727625618}
 
 DB_FILE = os.getenv("DB_FILE", "husterix.sqlite3")
 
@@ -149,8 +110,6 @@ def format_diamonds(value: float) -> str:
 
 
 def diamond_price(diamonds: int) -> int:
-    # 500 diamonds = 20,000 Toman
-    # => 40 Toman per diamond
     return diamonds * DIAMOND_PER_500 // 500
 
 
@@ -548,10 +507,6 @@ class Database:
             ).fetchone()
 
     def charge_hourly(self, user_id: int):
-        """
-        Charge exactly once per completed hour since last_charge_at.
-        If balance is insufficient, subscription is stopped.
-        """
         now = time.time()
 
         with self.connect() as db:
@@ -634,8 +589,6 @@ class Database:
             if existing:
                 return False
 
-            # A phone already registered in our users table cannot generate
-            # another referral reward.
             used_phone = db.execute("""
                 SELECT user_id FROM users
                 WHERE phone=? AND user_id != ?
@@ -820,7 +773,6 @@ async def update_clock(client: Client, user_id: int):
                 ).strip()
 
                 t = datetime.now(timezone.utc)
-                # Tehran = UTC+3:30
                 total_minutes = (t.hour * 60 + t.minute + 210) % (24 * 60)
                 hour = total_minutes // 60
                 minute = total_minutes % 60
@@ -911,7 +863,6 @@ async def start_userbot(
     phone: str,
     user_id: int,
 ):
-    # Make sure there is enough balance before starting.
     balance = db.get_balance(user_id)
 
     if balance < HOURLY_COST:
@@ -947,7 +898,6 @@ async def start_userbot(
         USER_FONT[me.id] = "stylized"
         CLOCK_STATUS[me.id] = True
 
-        # Basic incoming read handler.
         @client.on_message(filters.private & ~filters.me)
         async def private_incoming(_, message):
             try:
@@ -955,7 +905,6 @@ async def start_userbot(
             except Exception:
                 pass
 
-        # Commands on own account.
         @client.on_message(filters.me & filters.command("wallet", prefixes="/"))
         async def wallet_command(_, message):
             bal = db.get_balance(me.id)
@@ -1181,7 +1130,6 @@ async def contact_handler(client, message: Message):
 
     phone = normalize_phone(contact.phone_number or "")
 
-    # Telegram request_contact should normally be the user's own contact.
     if contact.user_id and contact.user_id != uid:
         await message.reply_text(
             "❌ لطفاً شماره خودت را با دکمه ارسال شماره بفرست.",
@@ -1218,8 +1166,6 @@ async def contact_handler(client, message: Message):
             )
             return
 
-        # The referral is only rewarded after the invitee successfully
-        # completes userbot login.
         LOGIN_STATES[uid] = {
             "step": "phone_for_login",
             "phone": phone,
@@ -1236,7 +1182,6 @@ async def contact_handler(client, message: Message):
         await begin_login(client, message, phone)
         return
 
-    # Normal login flow.
     await begin_login(client, message, phone)
 
 
@@ -1361,7 +1306,6 @@ async def finalize_login(message: Message, user_client: Client, state: dict):
             username=me.username or "",
         )
 
-        # Store session.
         with db.connect() as conn:
             conn.execute("""
                 UPDATE users
@@ -1383,7 +1327,6 @@ async def finalize_login(message: Message, user_client: Client, state: dict):
 
         referrer = state.get("referrer")
 
-        # Referral reward is granted only after successful Telegram login.
         if referrer and is_iranian_phone(phone):
             result = db.verify_referral(me.id)
 
@@ -1401,7 +1344,6 @@ async def finalize_login(message: Message, user_client: Client, state: dict):
 
         LOGIN_STATES.pop(uid, None)
 
-        # Start only if user has at least one hour of balance.
         balance = db.get_balance(me.id)
 
         if balance >= HOURLY_COST:
@@ -1641,8 +1583,6 @@ async def calculator_callback(client, callback):
 
 @manager_bot.on_callback_query(filters.regex("^copy_card$"))
 async def copy_card_callback(client, callback):
-    # Telegram bots cannot force-copy arbitrary text into the user's clipboard.
-    # Sending the number in a code span makes it easy to long-press/copy.
     await callback.answer(
         f"شماره کارت: {CARD_NUMBER}",
         show_alert=True,
@@ -2154,7 +2094,7 @@ async def userbot_monitor():
 
 
 # ============================================================
-# Main
+# Web Server & Main
 # ============================================================
 
 async def restore_userbots():
@@ -2182,6 +2122,19 @@ async def restore_userbots():
         )
 
 
+async def dummy_web_server():
+    """Starts a lightweight aiohttp server to pass Railway's port binding health check."""
+    app = web.Application()
+    app.router.add_get("/", lambda request: web.Response(text="HusteRIX Bot is running!"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    port = int(os.getenv("PORT", 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    logging.info(f"Dummy web server started on port {port}")
+
+
 async def main():
     logging.info("Starting HusteRIX...")
 
@@ -2195,6 +2148,8 @@ async def main():
     asyncio.create_task(userbot_monitor())
 
     logging.info("HusteRIX is online.")
+    
+    await dummy_web_server()
 
     await idle()
 
