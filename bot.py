@@ -1,2322 +1,2147 @@
-# -*- coding: utf-8 -*-
-"""
-HusteRIX - Telegram Userbot Manager + Diamond Economy
-=====================================================
-
-Features:
-- Multi-account Telegram userbot login via phone/code/2FA
-- Diamond wallet
-- Card-to-card diamond purchases
-- Inline calculator (0-9, backspace, confirm)
-- Minimum purchase: 500 diamonds
-- Rate: 500 diamonds = 20,000 Toman
-- Admin payment approval/rejection
-- Hourly userbot charge: 2.5 diamonds/hour
-- Referral system: +25 diamonds for a verified Iranian (+98) referral
-- SQLite transaction ledger
-- Basic userbot panel and commands
-- Auto restart of userbot instances
-- Environment-variable secrets
-
-IMPORTANT:
-1) NEVER put BOT_TOKEN/API_HASH in GitHub.
-2) Rotate any token/API credentials that were previously exposed.
-3) Set environment variables before running this file.
-
-Environment variables:
-  API_ID=...
-  API_HASH=...
-  BOT_TOKEN=...
-  GOD_ADMIN_IDS=123,456
-
-Optional:
-  DB_FILE=husterix.sqlite3
-  CARD_NUMBER=5022291579049451
-  CARD_OWNER=علی محمدی پور
-  DIAMOND_MIN=500
-  DIAMOND_PER_500=20000
-  HOURLY_COST=2.5
-  REFERRAL_REWARD=25
-"""
-
-import asyncio
-import logging
 import os
 import re
-import secrets
-import sqlite3
+import json
 import time
-from contextlib import contextmanager
+import uuid
+import asyncio
+import sqlite3
+import logging
+import traceback
+import secrets
+import hashlib
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
+from zoneinfo import ZoneInfo
+from collections import defaultdict, deque
+from contextlib import asynccontextmanager
 
-from pyrogram import Client, filters, idle
-from pyrogram.enums import ChatType, ChatAction
-from pyrogram.errors import SessionPasswordNeeded, ChatSendInlineForbidden
-from pyrogram.handlers import MessageHandler
+import httpx
+from cryptography.fernet import Fernet, InvalidToken
+from pyrogram import Client, filters, enums
 from pyrogram.types import (
-    Message,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    ReplyKeyboardRemove,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    InlineQueryResultArticle,
-    InputTextMessageContent,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    Message, CallbackQuery
 )
-from pyrogram.raw import functions
-from pyrogram import utils as pyrogram_utils
+from pyrogram.errors import (
+    RPCError, SessionPasswordNeeded, PhoneCodeInvalid,
+    PhoneCodeExpired, PhoneNumberInvalid, FloodWait,
+    UserNotParticipant, PeerIdInvalid
+)
 
 
 # ============================================================
-# Configuration
+# HusteRIX - single-file production-oriented Telegram platform
+# ============================================================
+#
+# Required environment:
+# BOT_TOKEN
+# API_ID
+# API_HASH
+# GOD_ADMIN_IDS            comma-separated Telegram IDs
+#
+# Required for encrypted session storage:
+# SESSION_ENCRYPTION_KEY   Fernet key; generate with:
+# python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+#
+# Payment:
+# CARD_NUMBER
+# CARD_OWNER
+#
+# Optional:
+# DB_PATH=/data/husterix.db
+# BOT_USERNAME
+# HOURLY_RATE=2.5
+# MIN_DIAMONDS=500
+# DIAMOND_PACK=500
+# DIAMOND_PACK_PRICE=20000
+# LOG_PATH=/data/husterix_errors.log
+#
+# Install:
+# pip install pyrogram tgcrypto cryptography httpx
+#
+# Railway:
+# use a persistent volume mounted at /data for SQLite/session durability.
 # ============================================================
 
-def env_required(name: str) -> str:
-    value = os.getenv(name, "").strip()
-    if not value:
-        raise RuntimeError(f"Environment variable {name} is required.")
-    return value
 
+APP_NAME = "HusteRIX"
 
-# Production credentials/config supplied for this deployment.
+DB_PATH = "husterix.sqlite3"
+LOG_PATH = "husterix_errors.log"
+
+BOT_TOKEN = "8432783132:AAHaNXKf_JQNQ8maiV_y2fF_efVUOVZiB2A"
 API_ID = 32955870
 API_HASH = "a40ba705a967c3c8e490f4684f42256a"
-BOT_TOKEN = "8432783132:AAHaNXKf_JQNQ8maiV_y2fF_efVUOVZiB2A"
+
+BOT_USERNAME = ""
+
+CARD_NUMBER = "5022291579049451"
+CARD_OWNER = "علی محمدی پور"
+
+HOURLY_RATE = Decimal("2.5")
+MIN_DIAMONDS = 500
+DIAMOND_PACK = 500
+DIAMOND_PACK_PRICE = 20000
 
 GOD_ADMIN_IDS = {
     7727625618
 }
 
-DB_FILE = os.getenv("DB_FILE", "husterix.sqlite3")
+TEHRAN = ZoneInfo("Asia/Tehran")
 
-CARD_NUMBER = os.getenv("CARD_NUMBER", "5022291579049451")
-CARD_OWNER = os.getenv("CARD_OWNER", "علی محمدی پور")
+MAX_REPEAT = 20
+MAX_DELETE = 100
+ENEMY_REPLY_LIMIT = 50
+SECRETARY_COOLDOWN = 300
+BILLING_INTERVAL = 3600
+ANTI_LOGIN_INTERVAL = 60
 
-DIAMOND_MIN = int(os.getenv("DIAMOND_MIN", "500"))
-DIAMOND_PER_500 = int(os.getenv("DIAMOND_PER_500", "20000"))
-HOURLY_COST = float(os.getenv("HOURLY_COST", "2.5"))
-REFERRAL_REWARD = float(os.getenv("REFERRAL_REWARD", "25"))
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is missing")
+if not API_ID or not API_HASH:
+    raise RuntimeError("API_ID/API_HASH are missing")
+if not GOD_ADMIN_IDS:
+    raise RuntimeError("GOD_ADMIN_IDS is missing")
+if not CARD_NUMBER or not CARD_OWNER:
+    raise RuntimeError("CARD_NUMBER/CARD_OWNER are missing")
 
-TEHRAN_OFFSET_HOURS = 3.5
+Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+Path(LOG_PATH).parent.mkdir(parents=True, exist_ok=True)
 
-
-# ============================================================
-# Logging
-# ============================================================
-
-# ============================================================
-# Persistent error logging
-# ============================================================
-ERROR_LOG_FILE = os.getenv("ERROR_LOG_FILE", "husterix_errors.log")
-
-def write_detailed_error(title: str, exc: Exception):
-    """Write a detailed, human-readable traceback to the persistent error log."""
-    try:
-        with open(ERROR_LOG_FILE, "a", encoding="utf-8") as f:
-            f.write("\n" + "=" * 72 + "\n")
-            f.write(f"TIME: {datetime.now().isoformat(timespec='seconds')}\n")
-            f.write(f"TITLE: {title}\n")
-            f.write(f"TYPE: {type(exc).__name__}\n")
-            f.write(f"MESSAGE: {exc}\n")
-            f.write("TRACEBACK:\n")
-            f.write(traceback.format_exc())
-            f.write("=" * 72 + "\n")
-    except Exception as e:
-        write_detailed_error("Unhandled exception", e)
-
-
-def get_error_log_text(lines: int = 80) -> str:
-    """Return the latest error log lines safely."""
-    try:
-        if not os.path.exists(ERROR_LOG_FILE):
-            return "✅ هنوز هیچ خطایی در لاگ ثبت نشده."
-        with open(ERROR_LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
-            data = f.readlines()
-        if not data:
-            return "✅ هنوز هیچ خطایی در لاگ ثبت نشده."
-        return "".join(data[-lines:])
-    except Exception as exc:
-        return f"❌ خطا در خواندن فایل لاگ: {exc}"
-
-
-def clear_error_log():
-    try:
-        with open(ERROR_LOG_FILE, "w", encoding="utf-8") as f:
-            f.write(
-                f"HusteRIX Error Log\n"
-                f"Cleared: {datetime.now().isoformat(timespec='seconds')}\n"
-            )
-        return True
-    except Exception:
-        return False
-
-
-
-class FlushFileHandler(logging.FileHandler):
-    def emit(self, record):
-        super().emit(record)
-        try:
-            self.flush()
-        except Exception:
-            pass
-
-_file_handler = FlushFileHandler(ERROR_LOG_FILE, encoding="utf-8")
-_file_handler.setLevel(logging.ERROR)
-_file_handler.setFormatter(logging.Formatter(
-    "[%(asctime)s] %(levelname)s - %(name)s - %(message)s"
+logger = logging.getLogger("husterix")
+logger.setLevel(logging.INFO)
+handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+handler.setFormatter(logging.Formatter(
+    "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 ))
-
-_root_logger = logging.getLogger()
-_root_logger.addHandler(_file_handler)
-
-def install_global_exception_logging():
-    import sys
-    def handle_exception(exc_type, exc_value, exc_traceback):
-        if issubclass(exc_type, KeyboardInterrupt):
-            sys.__excepthook__(exc_type, exc_value, exc_traceback)
-            return
-        logging.getLogger("HusteRIX").critical(
-            "UNHANDLED EXCEPTION",
-            exc_info=(exc_type, exc_value, exc_traceback)
-        )
-        try:
-            with open(ERROR_LOG_FILE, "a", encoding="utf-8") as f:
-                f.write("\n" + "=" * 72 + "\n")
-                f.write(f"TIME: {datetime.now().isoformat(timespec='seconds')}\n")
-                f.write("TITLE: UNHANDLED EXCEPTION\n")
-                f.write(f"TYPE: {exc_type.__name__}\n")
-                f.write(f"MESSAGE: {exc_value}\n")
-                f.write("TRACEBACK:\n")
-                f.write("".join(traceback.format_exception(exc_type, exc_value, exc_traceback)))
-                f.write("=" * 72 + "\n")
-        except Exception:
-            pass
-    sys.excepthook = handle_exception
-
-    try:
-        loop = asyncio.get_event_loop()
-        def loop_exception_handler(loop, context):
-            exc = context.get("exception")
-            if exc:
-                logging.getLogger("HusteRIX").critical(
-                    "ASYNCIO UNHANDLED EXCEPTION",
-                    exc_info=(type(exc), exc, exc.__traceback__)
-                )
-            else:
-                logging.getLogger("HusteRIX").critical(
-                    "ASYNCIO ERROR: %s", context.get("message", context)
-                )
-        loop.set_exception_handler(loop_exception_handler)
-    except Exception:
-        logging.exception("Could not install asyncio exception handler")
-
-install_global_exception_logging()
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] %(levelname)s - %(message)s"
-)
+logger.addHandler(handler)
+logger.addHandler(logging.StreamHandler())
 
 
-# ============================================================
-# Pyrogram peer ID compatibility patch
-# ============================================================
-
-_original_get_peer_type = pyrogram_utils.get_peer_type
-
-
-def patched_get_peer_type(peer_id: int) -> str:
-    try:
-        return _original_get_peer_type(peer_id)
-    except ValueError:
-        if str(peer_id).startswith("-100"):
-            return "channel"
-        raise
-
-
-pyrogram_utils.get_peer_type = patched_get_peer_type
-
-
-# ============================================================
-# Helpers
-# ============================================================
-
-def now_iso() -> str:
+def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
-def format_number(value) -> str:
-    if isinstance(value, float) and value.is_integer():
-        value = int(value)
-    return f"{value:,}"
+def tehran_now():
+    return datetime.now(TEHRAN)
 
 
-def format_diamonds(value: float) -> str:
-    if float(value).is_integer():
-        return f"{int(value):,}"
-    return f"{value:,.2f}"
+def parse_ids(value):
+    return {int(x.strip()) for x in value.split(",") if x.strip().lstrip("-").isdigit()}
 
 
-def diamond_price(diamonds: int) -> int:
-    # 500 diamonds = 20,000 Toman
-    # => 40 Toman per diamond
-    return diamonds * DIAMOND_PER_500 // 500
+def fmt_diamond(value):
+    d = Decimal(str(value))
+    return f"{d.normalize():f}"
 
 
-def normalize_phone(phone: str) -> str:
-    phone = re.sub(r"[^\d+]", "", phone)
-    if phone.startswith("00"):
-        phone = "+" + phone[2:]
-    return phone
+def amount_toman(diamonds):
+    return (Decimal(diamonds) / Decimal(DIAMOND_PACK) * Decimal(DIAMOND_PACK_PRICE)).quantize(Decimal("1"))
 
 
-def is_iranian_phone(phone: str) -> bool:
-    return normalize_phone(phone).startswith("+98")
+def safe_text(text, limit=4000):
+    text = str(text or "")
+    return text if len(text) <= limit else text[:limit] + "…"
 
 
-def card_display() -> str:
-    digits = re.sub(r"\D", "", CARD_NUMBER)
-    if len(digits) == 16:
-        return f"{digits[:4]} {digits[4:8]} {digits[8:12]} {digits[12:]}"
-    return CARD_NUMBER
+def require_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
-# ============================================================
-# Database
-# ============================================================
+class ContextFilter(logging.Filter):
+    def filter(self, record):
+        if not hasattr(record, "user_id"):
+            record.user_id = "-"
+        if not hasattr(record, "session_id"):
+            record.session_id = "-"
+        return True
 
-class Database:
-    def __init__(self, path: str):
+
+logger.addFilter(ContextFilter())
+
+
+def log_exception(message, *, user_id=None, session_id=None, exc=None, level=logging.ERROR):
+    if exc is None:
+        exc = traceback.format_exc()
+    logger.log(
+        level,
+        "%s | user_id=%s | session_id=%s | traceback=%s",
+        message, user_id or "-", session_id or "-", exc
+    )
+
+
+class DB:
+    def __init__(self, path):
         self.path = path
-        self._init()
+        self._lock = asyncio.Lock()
 
-    @contextmanager
-    def connect(self):
-        conn = sqlite3.connect(self.path, timeout=30)
+    def _connect(self):
+        conn = sqlite3.connect(self.path, timeout=30, isolation_level=None)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=30000")
+        return conn
+
+    async def run(self, fn, *args):
+        async with self._lock:
+            return await asyncio.to_thread(self._run_sync, fn, *args)
+
+    def _run_sync(self, fn, *args):
+        conn = self._connect()
         try:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA foreign_keys=ON")
-            yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
+            return fn(conn, *args)
         finally:
             conn.close()
 
-    def _init(self):
-        with self.connect() as db:
-            db.executescript("""
+    async def init(self):
+        def setup(conn):
+            conn.executescript("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
-                phone TEXT DEFAULT '',
-                first_name TEXT DEFAULT '',
-                username TEXT DEFAULT '',
-                session_string TEXT DEFAULT '',
+                username TEXT,
+                first_name TEXT,
+                phone TEXT,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                is_banned INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS wallets (
-                user_id INTEGER PRIMARY KEY,
-                balance REAL NOT NULL DEFAULT 0,
+                user_id INTEGER PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
+                balance TEXT NOT NULL DEFAULT '0'
+            );
+
+            CREATE TABLE IF NOT EXISTS sessions (
+                session_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+                phone TEXT,
+                username TEXT,
+                encrypted_session TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'STOPPED',
+                created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+                last_seen TEXT,
+                UNIQUE(user_id)
             );
 
             CREATE TABLE IF NOT EXISTS transactions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                type TEXT NOT NULL,
-                amount REAL NOT NULL,
-                balance_before REAL NOT NULL,
-                balance_after REAL NOT NULL,
-                description TEXT NOT NULL,
-                reference_id TEXT DEFAULT '',
-                created_at TEXT NOT NULL,
-                FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+                user_id INTEGER NOT NULL REFERENCES users(user_id),
+                tx_type TEXT NOT NULL,
+                amount TEXT NOT NULL,
+                balance_after TEXT NOT NULL,
+                description TEXT,
+                created_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS payments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                diamonds INTEGER NOT NULL,
-                toman INTEGER NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                receipt_file_id TEXT DEFAULT '',
-                admin_message_chat_id INTEGER,
-                admin_message_id INTEGER,
+                payment_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(user_id),
+                diamond_amount INTEGER NOT NULL,
+                amount_toman INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'PENDING',
+                receipt_file_id TEXT,
                 created_at TEXT NOT NULL,
-                reviewed_at TEXT DEFAULT '',
+                reviewed_at TEXT,
                 reviewed_by INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS referrals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                inviter_id INTEGER NOT NULL,
-                invitee_id INTEGER NOT NULL UNIQUE,
-                phone TEXT NOT NULL,
-                reward REAL NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                created_at TEXT NOT NULL,
-                verified_at TEXT DEFAULT '',
-                UNIQUE(inviter_id, invitee_id)
+                user_id INTEGER NOT NULL UNIQUE REFERENCES users(user_id),
+                phone TEXT,
+                referrer_id INTEGER REFERENCES users(user_id),
+                registration_status TEXT NOT NULL DEFAULT 'PENDING',
+                reward_status TEXT NOT NULL DEFAULT 'UNPAID',
+                created_at TEXT NOT NULL
             );
 
-            CREATE TABLE IF NOT EXISTS subscriptions (
-                user_id INTEGER PRIMARY KEY,
-                active INTEGER NOT NULL DEFAULT 0,
-                last_charge_at REAL NOT NULL DEFAULT 0,
-                started_at REAL NOT NULL DEFAULT 0,
-                stopped_at REAL NOT NULL DEFAULT 0,
-                FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+            CREATE TABLE IF NOT EXISTS user_settings (
+                user_id INTEGER PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
+                clock INTEGER NOT NULL DEFAULT 0,
+                font TEXT NOT NULL DEFAULT 'normal',
+                bold INTEGER NOT NULL DEFAULT 0,
+                secretary INTEGER NOT NULL DEFAULT 0,
+                secretary_text TEXT NOT NULL DEFAULT 'سلام! در حال حاضر آفلاین هستم و پیام شما را دریافت کردم...',
+                auto_seen INTEGER NOT NULL DEFAULT 0,
+                pv_lock INTEGER NOT NULL DEFAULT 0,
+                anti_login INTEGER NOT NULL DEFAULT 0,
+                typing INTEGER NOT NULL DEFAULT 0,
+                playing INTEGER NOT NULL DEFAULT 0,
+                translation TEXT,
+                copy_mode INTEGER NOT NULL DEFAULT 0,
+                saved_identity TEXT,
+                global_enemy INTEGER NOT NULL DEFAULT 0
             );
 
-            CREATE INDEX IF NOT EXISTS idx_transactions_user
-            ON transactions(user_id, created_at DESC);
+            CREATE TABLE IF NOT EXISTS enemy_users (
+                user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+                target_id INTEGER NOT NULL,
+                PRIMARY KEY(user_id, target_id)
+            );
 
-            CREATE INDEX IF NOT EXISTS idx_payments_status
-            ON payments(status);
+            CREATE TABLE IF NOT EXISTS muted_users (
+                user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+                target_id INTEGER NOT NULL,
+                PRIMARY KEY(user_id, target_id)
+            );
 
-            CREATE INDEX IF NOT EXISTS idx_referrals_status
-            ON referrals(status);
+            CREATE TABLE IF NOT EXISTS blocked_users (
+                user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+                target_id INTEGER NOT NULL,
+                PRIMARY KEY(user_id, target_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS reactions (
+                user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+                target_id INTEGER NOT NULL,
+                reaction TEXT NOT NULL,
+                PRIMARY KEY(user_id, target_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS admin_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                target_user_id INTEGER,
+                details TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS error_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                level TEXT,
+                module TEXT,
+                user_id INTEGER,
+                session_id TEXT,
+                exception_type TEXT,
+                exception_message TEXT,
+                traceback TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS broadcasts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_id INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                success INTEGER NOT NULL DEFAULT 0,
+                failed INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_tx_user ON transactions(user_id, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status, created_at);
+            CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
+            CREATE INDEX IF NOT EXISTS idx_errors_created ON error_logs(id DESC);
+            CREATE INDEX IF NOT EXISTS idx_referrer ON referrals(referrer_id);
             """)
+        await self.run(setup)
 
-    def ensure_user(
-        self,
-        user_id: int,
-        phone: str = "",
-        first_name: str = "",
-        username: str = "",
-    ):
-        now = now_iso()
-        with self.connect() as db:
-            db.execute("""
-                INSERT INTO users(user_id, phone, first_name, username, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(user_id) DO UPDATE SET
-                    phone=CASE WHEN excluded.phone != '' THEN excluded.phone ELSE users.phone END,
-                    first_name=CASE WHEN excluded.first_name != '' THEN excluded.first_name ELSE users.first_name END,
-                    username=CASE WHEN excluded.username != '' THEN excluded.username ELSE users.username END,
-                    updated_at=excluded.updated_at
-            """, (user_id, phone, first_name, username, now, now))
-
-            db.execute("""
-                INSERT INTO wallets(user_id, balance, updated_at)
-                VALUES (?, 0, ?)
-                ON CONFLICT(user_id) DO NOTHING
-            """, (user_id, now))
-
-            db.execute("""
-                INSERT INTO subscriptions(user_id)
-                VALUES (?)
-                ON CONFLICT(user_id) DO NOTHING
-            """, (user_id,))
-
-    def get_user(self, user_id: int):
-        with self.connect() as db:
-            return db.execute(
-                "SELECT * FROM users WHERE user_id=?",
-                (user_id,)
-            ).fetchone()
-
-    def get_balance(self, user_id: int) -> float:
-        self.ensure_user(user_id)
-        with self.connect() as db:
-            row = db.execute(
-                "SELECT balance FROM wallets WHERE user_id=?",
-                (user_id,)
-            ).fetchone()
-            return float(row["balance"] if row else 0)
-
-    def add_balance(
-        self,
-        user_id: int,
-        amount: float,
-        tx_type: str,
-        description: str,
-        reference_id: str = "",
-    ) -> float:
-        self.ensure_user(user_id)
-        now = now_iso()
-
-        with self.connect() as db:
-            row = db.execute(
-                "SELECT balance FROM wallets WHERE user_id=?",
-                (user_id,)
-            ).fetchone()
-
-            before = float(row["balance"])
-            after = before + amount
-
-            if after < 0:
-                raise ValueError("Insufficient balance.")
-
-            db.execute(
-                "UPDATE wallets SET balance=?, updated_at=? WHERE user_id=?",
-                (after, now, user_id)
-            )
-
-            db.execute("""
-                INSERT INTO transactions(
-                    user_id, type, amount, balance_before, balance_after,
-                    description, reference_id, created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                user_id,
-                tx_type,
-                amount,
-                before,
-                after,
-                description,
-                reference_id,
-                now,
-            ))
-
-            return after
-
-    def get_transactions(self, user_id: int, limit: int = 10):
-        with self.connect() as db:
-            return db.execute("""
-                SELECT *
-                FROM transactions
-                WHERE user_id=?
-                ORDER BY id DESC
-                LIMIT ?
-            """, (user_id, limit)).fetchall()
-
-    def create_payment(self, user_id: int, diamonds: int, toman: int) -> int:
-        with self.connect() as db:
-            cur = db.execute("""
-                INSERT INTO payments(
-                    user_id, diamonds, toman, status, created_at
-                )
-                VALUES (?, ?, ?, 'pending', ?)
-            """, (user_id, diamonds, toman, now_iso()))
-            return cur.lastrowid
-
-    def get_payment(self, payment_id: int):
-        with self.connect() as db:
-            return db.execute(
-                "SELECT * FROM payments WHERE id=?",
-                (payment_id,)
-            ).fetchone()
-
-    def get_latest_pending_payment(self, user_id: int):
-        with self.connect() as db:
-            return db.execute("""
-                SELECT *
-                FROM payments
-                WHERE user_id=? AND status='awaiting_receipt'
-                ORDER BY id DESC LIMIT 1
-            """, (user_id,)).fetchone()
-
-    def set_payment_receipt(
-        self,
-        payment_id: int,
-        file_id: str,
-        admin_chat_id: int,
-        admin_message_id: int,
-    ):
-        with self.connect() as db:
-            db.execute("""
-                UPDATE payments
-                SET status='awaiting_admin',
-                    receipt_file_id=?,
-                    admin_message_chat_id=?,
-                    admin_message_id=?
-                WHERE id=? AND status='pending'
-            """, (
-                file_id,
-                admin_chat_id,
-                admin_message_id,
-                payment_id,
-            ))
-
-    def mark_payment_awaiting_receipt(self, payment_id: int):
-        with self.connect() as db:
-            db.execute("""
-                UPDATE payments
-                SET status='awaiting_receipt'
-                WHERE id=? AND status='pending'
-            """, (payment_id,))
-
-    def approve_payment(self, payment_id: int, admin_id: int):
-        now = now_iso()
-
-        with self.connect() as db:
-            payment = db.execute(
-                "SELECT * FROM payments WHERE id=?",
-                (payment_id,)
-            ).fetchone()
-
-            if not payment:
-                raise ValueError("Payment not found.")
-
-            if payment["status"] != "awaiting_admin":
-                raise ValueError("This payment is no longer pending.")
-
-            user_id = payment["user_id"]
-            amount = float(payment["diamonds"])
-
-            wallet = db.execute(
-                "SELECT balance FROM wallets WHERE user_id=?",
-                (user_id,)
-            ).fetchone()
-
-            if not wallet:
-                db.execute("""
-                    INSERT INTO wallets(user_id, balance, updated_at)
-                    VALUES (?, 0, ?)
-                """, (user_id, now))
-                before = 0.0
-            else:
-                before = float(wallet["balance"])
-
-            after = before + amount
-
-            db.execute("""
-                UPDATE wallets
-                SET balance=?, updated_at=?
-                WHERE user_id=?
-            """, (after, now, user_id))
-
-            db.execute("""
-                INSERT INTO transactions(
-                    user_id, type, amount, balance_before, balance_after,
-                    description, reference_id, created_at
-                )
-                VALUES (?, 'purchase', ?, ?, ?, ?, ?, ?)
-            """, (
-                user_id,
-                amount,
-                before,
-                after,
-                f"خرید {int(amount)} الماس با کارت‌به‌کارت",
-                str(payment_id),
-                now,
-            ))
-
-            db.execute("""
-                UPDATE payments
-                SET status='approved',
-                    reviewed_at=?,
-                    reviewed_by=?
-                WHERE id=?
-            """, (now, admin_id, payment_id))
-
-            return after
-
-    def reject_payment(self, payment_id: int, admin_id: int):
-        with self.connect() as db:
-            payment = db.execute(
-                "SELECT * FROM payments WHERE id=?",
-                (payment_id,)
-            ).fetchone()
-
-            if not payment:
-                raise ValueError("Payment not found.")
-
-            if payment["status"] != "awaiting_admin":
-                raise ValueError("This payment is no longer pending.")
-
-            db.execute("""
-                UPDATE payments
-                SET status='rejected',
-                    reviewed_at=?,
-                    reviewed_by=?
-                WHERE id=?
-            """, (now_iso(), admin_id, payment_id))
-
-    def start_subscription(self, user_id: int):
-        now = time.time()
-        self.ensure_user(user_id)
-
-        with self.connect() as db:
-            db.execute("""
-                UPDATE subscriptions
-                SET active=1, started_at=?, stopped_at=0, last_charge_at=?
-                WHERE user_id=?
-            """, (now, now, user_id))
-
-    def stop_subscription(self, user_id: int):
-        with self.connect() as db:
-            db.execute("""
-                UPDATE subscriptions
-                SET active=0, stopped_at=?
-                WHERE user_id=?
-            """, (time.time(), user_id))
-
-    def get_subscription(self, user_id: int):
-        with self.connect() as db:
-            return db.execute(
-                "SELECT * FROM subscriptions WHERE user_id=?",
-                (user_id,)
-            ).fetchone()
-
-    def charge_hourly(self, user_id: int):
-        """
-        Charge exactly once per completed hour since last_charge_at.
-        If balance is insufficient, subscription is stopped.
-        """
-        now = time.time()
-
-        with self.connect() as db:
-            sub = db.execute(
-                "SELECT * FROM subscriptions WHERE user_id=?",
-                (user_id,)
-            ).fetchone()
-
-            if not sub or not sub["active"]:
-                return "inactive", 0, 0
-
-            last = float(sub["last_charge_at"] or 0)
-            elapsed = now - last
-
-            if elapsed < 3600:
-                return "waiting", 0, elapsed
-
-            hours = int(elapsed // 3600)
-            total_cost = hours * HOURLY_COST
-
-            wallet = db.execute(
-                "SELECT balance FROM wallets WHERE user_id=?",
-                (user_id,)
-            ).fetchone()
-
-            balance = float(wallet["balance"] if wallet else 0)
-
-            if balance < total_cost:
-                db.execute("""
-                    UPDATE subscriptions
-                    SET active=0, stopped_at=?
+    async def ensure_user(self, user_id, username=None, first_name=None, phone=None):
+        def fn(conn):
+            t = now_iso()
+            row = conn.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,)).fetchone()
+            if row:
+                conn.execute("""
+                    UPDATE users SET username=?, first_name=?, phone=?, updated_at=?
                     WHERE user_id=?
-                """, (now, user_id))
-                return "insufficient", 0, balance
-
-            before = balance
-            after = balance - total_cost
-
-            db.execute("""
-                UPDATE wallets
-                SET balance=?, updated_at=?
-                WHERE user_id=?
-            """, (after, now_iso(), user_id))
-
-            db.execute("""
-                INSERT INTO transactions(
-                    user_id, type, amount, balance_before, balance_after,
-                    description, reference_id, created_at
-                )
-                VALUES (?, 'hourly_charge', ?, ?, ?, ?, ?, ?)
-            """, (
-                user_id,
-                -total_cost,
-                before,
-                after,
-                f"هزینه استفاده از سلف - {hours} ساعت",
-                f"hourly:{int(now)}",
-                now_iso(),
-            ))
-
-            db.execute("""
-                UPDATE subscriptions
-                SET last_charge_at=?
-                WHERE user_id=?
-            """, (last + hours * 3600, user_id))
-
-            return "charged", total_cost, after
-
-    def create_referral(self, inviter_id: int, invitee_id: int, phone: str):
-        if inviter_id == invitee_id:
-            return False
-
-        phone = normalize_phone(phone)
-
-        with self.connect() as db:
-            existing = db.execute("""
-                SELECT id FROM referrals WHERE invitee_id=?
-            """, (invitee_id,)).fetchone()
-
-            if existing:
-                return False
-
-            # A phone already registered in our users table cannot generate
-            # another referral reward.
-            used_phone = db.execute("""
-                SELECT user_id FROM users
-                WHERE phone=? AND user_id != ?
-            """, (phone, invitee_id)).fetchone()
-
-            if used_phone:
-                return False
-
-            db.execute("""
-                INSERT INTO referrals(
-                    inviter_id, invitee_id, phone, reward, status, created_at
-                )
-                VALUES (?, ?, ?, ?, 'pending', ?)
-            """, (
-                inviter_id,
-                invitee_id,
-                phone,
-                REFERRAL_REWARD,
-                now_iso(),
-            ))
-            return True
-
-    def verify_referral(self, invitee_id: int):
-        now = now_iso()
-
-        with self.connect() as db:
-            ref = db.execute("""
-                SELECT * FROM referrals
-                WHERE invitee_id=? AND status='pending'
-            """, (invitee_id,)).fetchone()
-
-            if not ref:
-                return None
-
-            inviter_id = int(ref["inviter_id"])
-            reward = float(ref["reward"])
-
-            wallet = db.execute(
-                "SELECT balance FROM wallets WHERE user_id=?",
-                (inviter_id,)
-            ).fetchone()
-
-            if not wallet:
-                db.execute("""
-                    INSERT INTO wallets(user_id, balance, updated_at)
-                    VALUES (?, 0, ?)
-                """, (inviter_id, now))
-                before = 0.0
+                """, (username, first_name, phone, t, user_id))
             else:
-                before = float(wallet["balance"])
+                conn.execute("""
+                    INSERT INTO users(user_id,username,first_name,phone,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?)
+                """, (user_id, username, first_name, phone, t, t))
+                conn.execute("INSERT INTO wallets(user_id,balance) VALUES(?, '0')", (user_id,))
+                conn.execute("INSERT INTO user_settings(user_id) VALUES(?)", (user_id,))
+        await self.run(fn)
 
-            after = before + reward
-
-            db.execute("""
-                UPDATE wallets
-                SET balance=?, updated_at=?
-                WHERE user_id=?
-            """, (after, now, inviter_id))
-
-            db.execute("""
-                INSERT INTO transactions(
-                    user_id, type, amount, balance_before, balance_after,
-                    description, reference_id, created_at
-                )
-                VALUES (?, 'referral_reward', ?, ?, ?, ?, ?, ?)
-            """, (
-                inviter_id,
-                reward,
-                before,
-                after,
-                f"پاداش رفرال برای کاربر {invitee_id}",
-                f"ref:{ref['id']}",
-                now,
-            ))
-
-            db.execute("""
-                UPDATE referrals
-                SET status='verified', verified_at=?
-                WHERE id=? AND status='pending'
-            """, (now, ref["id"]))
-
-            return {
-                "inviter_id": inviter_id,
-                "invitee_id": invitee_id,
-                "reward": reward,
-                "balance": after,
-            }
-
-    def get_all_users(self):
-        with self.connect() as db:
-            return db.execute(
-                "SELECT * FROM users ORDER BY created_at DESC"
-            ).fetchall()
-
-    def get_stats(self):
-        with self.connect() as db:
-            users = db.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
-            wallets = db.execute(
-                "SELECT COALESCE(SUM(balance), 0) s FROM wallets"
-            ).fetchone()["s"]
-            active = db.execute(
-                "SELECT COUNT(*) c FROM subscriptions WHERE active=1"
-            ).fetchone()["c"]
-            pending = db.execute("""
-                SELECT COUNT(*) c
-                FROM payments
-                WHERE status='awaiting_admin'
-            """).fetchone()["c"]
-            referrals = db.execute("""
-                SELECT COUNT(*) c
-                FROM referrals
-                WHERE status='verified'
-            """).fetchone()["c"]
-
-            return {
-                "users": users,
-                "diamonds": float(wallets),
-                "active": active,
-                "pending": pending,
-                "referrals": referrals,
-            }
-
-
-db = Database(DB_FILE)
-
-
-# ============================================================
-# Runtime state
-# ============================================================
-
-LOGIN_STATES = {}
-PURCHASE_STATES = {}
-ADMIN_STATES = {}
-
-ACTIVE_BOTS = {}
-PENDING_ADMIN_MESSAGES = {}
-
-
-# ============================================================
-# Userbot features
-# ============================================================
-
-FONT_STYLES = {
-    "stylized": {
-        "0":"𝟬","1":"𝟭","2":"𝟮","3":"𝟯","4":"𝟰",
-        "5":"𝟱","6":"𝟲","7":"𝟳","8":"𝟴","9":"𝟵",":":":"
-    },
-    "doublestruck": {
-        "0":"𝟘","1":"𝟙","2":"𝟚","3":"𝟛","4":"𝟜",
-        "5":"𝟝","6":"𝟞","7":"𝟟","8":"𝟠","9":"𝟡",":":":"
-    },
-    "monospace": {
-        "0":"𝟶","1":"𝟷","2":"𝟸","3":"𝟹","4":"𝟺",
-        "5":"𝟻","6":"𝟼","7":"𝟽","8":"𝟾","9":"𝟿",":":":"
-    },
-    "circled": {
-        "0":"⓪","1":"①","2":"②","3":"③","4":"④",
-        "5":"⑤","6":"⑥","7":"⑦","8":"⑧","9":"⑨",":":"∶"
-    },
-}
-
-FONT_ORDER = list(FONT_STYLES.keys())
-CLOCK_STATUS = {}
-USER_FONT = {}
-
-
-def stylize_time(value: str, style: str) -> str:
-    mapping = FONT_STYLES.get(style, FONT_STYLES["stylized"])
-    return "".join(mapping.get(x, x) for x in value)
-
-
-async def update_clock(client: Client, user_id: int):
-    while user_id in ACTIVE_BOTS:
-        try:
-            if CLOCK_STATUS.get(user_id, True):
-                me = await client.get_me()
-                current = me.first_name or ""
-                clean = re.sub(
-                    r"(?:\s*[𝟬-𝟿𝟘-𝟡⓪-⑨𝟶-𝟿∶:]+)+$",
-                    "",
-                    current
-                ).strip()
-
-                t = datetime.now(timezone.utc)
-                # Tehran = UTC+3:30
-                total_minutes = (t.hour * 60 + t.minute + 210) % (24 * 60)
-                hour = total_minutes // 60
-                minute = total_minutes % 60
-                raw = f"{hour:02d}:{minute:02d}"
-
-                styled = stylize_time(
-                    raw,
-                    USER_FONT.get(user_id, "stylized")
-                )
-                new_name = f"{clean} {styled}".strip()
-
-                if new_name != current:
-                    await client.update_profile(first_name=new_name)
-
-            await asyncio.sleep(60)
-        except Exception as exc:
-            logging.warning("Clock error for %s: %s", user_id, exc)
-            await asyncio.sleep(60)
-
-
-async def charge_loop():
-    while True:
-        try:
-            users = db.get_all_users()
-
-            for row in users:
-                uid = int(row["user_id"])
-                result, amount, extra = db.charge_hourly(uid)
-
-                if result == "charged" and uid in ACTIVE_BOTS:
-                    await safe_send(
-                        ACTIVE_BOTS[uid][0],
-                        "me",
-                        f"💎 هزینه استفاده کسر شد.\n\n"
-                        f"⏱ مدت: {int(amount / HOURLY_COST)} ساعت\n"
-                        f"💎 کسر شده: {format_diamonds(amount)}\n"
-                        f"💰 موجودی: {format_diamonds(extra)}"
-                    )
-
-                elif result == "insufficient" and uid in ACTIVE_BOTS:
-                    client = ACTIVE_BOTS[uid][0]
-
-                    await safe_send(
-                        client,
-                        "me",
-                        "⛔️ موجودی الماس برای ادامه استفاده کافی نیست.\n\n"
-                        f"💰 موجودی: {format_diamonds(extra)} 💎\n"
-                        f"💳 هزینه ساعتی: {format_diamonds(HOURLY_COST)} 💎\n\n"
-                        "سلف متوقف شد."
-                    )
-
-                    await stop_userbot(uid)
-
-            await asyncio.sleep(30)
-
-        except Exception as exc:
-            logging.exception("Charge loop error: %s", exc)
-            await asyncio.sleep(30)
-
-
-async def safe_send(client: Client, chat_id, text: str):
-    try:
-        await client.send_message(chat_id, text)
-    except Exception as e:
-        write_detailed_error("Unhandled exception", e)
-
-
-async def stop_userbot(user_id: int):
-    item = ACTIVE_BOTS.pop(user_id, None)
-    if not item:
-        return
-
-    client, tasks = item
-
-    for task in tasks:
-        task.cancel()
-
-    try:
-        await client.stop()
-    except Exception as e:
-        write_detailed_error("Unhandled exception", e)
-
-    db.stop_subscription(user_id)
-
-
-async def start_userbot(
-    session_string: str,
-    phone: str,
-    user_id: int,
-):
-    # Make sure there is enough balance before starting.
-    balance = db.get_balance(user_id)
-
-    if balance < HOURLY_COST:
-        logging.info(
-            "Userbot %s not started: balance %.2f < %.2f",
-            user_id,
-            balance,
-            HOURLY_COST,
-        )
-        return False
-
-    if user_id in ACTIVE_BOTS:
-        await stop_userbot(user_id)
-
-    client = Client(
-        f"husterix_{user_id}",
-        api_id=API_ID,
-        api_hash=API_HASH,
-        session_string=session_string,
-    )
-
-    try:
-        await client.start()
-        me = await client.get_me()
-
-        db.ensure_user(
-            me.id,
-            phone=phone,
-            first_name=me.first_name or "",
-            username=me.username or "",
+    async def get_user(self, user_id):
+        return await self.run(
+            lambda c: c.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
         )
 
-        USER_FONT[me.id] = "stylized"
-        CLOCK_STATUS[me.id] = True
+    async def get_wallet(self, user_id):
+        row = await self.run(
+            lambda c: c.execute("SELECT balance FROM wallets WHERE user_id=?", (user_id,)).fetchone()
+        )
+        return Decimal(row["balance"]) if row else Decimal("0")
 
-        # Basic incoming read handler.
-        @client.on_message(filters.private & ~filters.me)
-        async def private_incoming(_, message):
+    async def wallet_change(self, user_id, amount, tx_type, description=""):
+        amount = Decimal(str(amount))
+
+        def fn(conn):
+            conn.execute("BEGIN IMMEDIATE")
             try:
-                await message.read()
+                row = conn.execute(
+                    "SELECT balance FROM wallets WHERE user_id=?", (user_id,)
+                ).fetchone()
+                if not row:
+                    raise ValueError("Wallet does not exist")
+                before = Decimal(row["balance"])
+                after = before + amount
+                if after < 0:
+                    conn.execute("ROLLBACK")
+                    return False, before
+                conn.execute(
+                    "UPDATE wallets SET balance=? WHERE user_id=?",
+                    (str(after), user_id)
+                )
+                conn.execute("""
+                    INSERT INTO transactions(
+                        user_id,tx_type,amount,balance_after,description,created_at
+                    ) VALUES(?,?,?,?,?,?)
+                """, (
+                    user_id, tx_type, str(amount), str(after),
+                    description, now_iso()
+                ))
+                conn.execute("COMMIT")
+                return True, after
             except Exception:
-                pass
+                conn.execute("ROLLBACK")
+                raise
 
-        # Commands on own account.
-        @client.on_message(filters.me & filters.command("wallet", prefixes="/"))
-        async def wallet_command(_, message):
-            bal = db.get_balance(me.id)
-            await message.edit_text(
-                f"💎 Wallet\n\n"
-                f"💰 موجودی: {format_diamonds(bal)} 💎\n"
-                f"⏱ هزینه ساعتی: {format_diamonds(HOURLY_COST)} 💎"
+        return await self.run(fn)
+
+    async def transactions(self, user_id, limit=12):
+        return await self.run(lambda c: c.execute("""
+            SELECT * FROM transactions WHERE user_id=?
+            ORDER BY id DESC LIMIT ?
+        """, (user_id, limit)).fetchall())
+
+    async def settings(self, user_id):
+        return await self.run(
+            lambda c: c.execute("SELECT * FROM user_settings WHERE user_id=?", (user_id,)).fetchone()
+        )
+
+    async def update_setting(self, user_id, field, value):
+        allowed = {
+            "clock", "font", "bold", "secretary", "secretary_text",
+            "auto_seen", "pv_lock", "anti_login", "typing", "playing",
+            "translation", "copy_mode", "saved_identity", "global_enemy"
+        }
+        if field not in allowed:
+            raise ValueError("Invalid setting")
+        await self.run(
+            lambda c: c.execute(
+                f"UPDATE user_settings SET {field}=? WHERE user_id=?",
+                (value, user_id)
             )
+        )
 
-        @client.on_message(filters.me & filters.regex(r"^کیف پول$"))
-        async def wallet_farsi(_, message):
-            bal = db.get_balance(me.id)
-            await message.edit_text(
-                f"💎 کیف پول HusteRIX\n\n"
-                f"💰 موجودی: {format_diamonds(bal)} 💎\n"
-                f"⏱ هزینه استفاده: {format_diamonds(HOURLY_COST)} 💎/ساعت"
-            )
+    async def set_session(self, user_id, session_id, encrypted, phone, username, status="STOPPED"):
+        t = now_iso()
+        await self.run(lambda c: c.execute("""
+            INSERT INTO sessions(session_id,user_id,phone,username,encrypted_session,status,
+                                 created_at,updated_at,last_seen)
+            VALUES(?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                session_id=excluded.session_id,
+                phone=excluded.phone,
+                username=excluded.username,
+                encrypted_session=excluded.encrypted_session,
+                status=excluded.status,
+                updated_at=excluded.updated_at,
+                last_seen=excluded.last_seen
+        """, (session_id, user_id, phone, username, encrypted, status, t, t, t)))
 
-        @client.on_message(filters.me & filters.regex(r"^راهنما$"))
-        async def help_handler(_, message):
-            await message.edit_text(
-                "⚡️ HusteRIX\n\n"
-                "دستورات:\n"
-                "• کیف پول\n"
-                "• راهنما\n"
-                "• پنل\n"
-                "• تاس\n"
-                "• بولینگ"
-            )
+    async def update_session(self, session_id, **fields):
+        allowed = {"status", "username", "phone", "last_seen", "encrypted_session"}
+        fields = {k: v for k, v in fields.items() if k in allowed}
+        if not fields:
+            return
+        fields["updated_at"] = now_iso()
+        sets = ", ".join(f"{k}=?" for k in fields)
+        vals = list(fields.values()) + [session_id]
+        await self.run(lambda c: c.execute(
+            f"UPDATE sessions SET {sets} WHERE session_id=?", vals
+        ))
 
-        @client.on_message(filters.me & filters.regex(r"^تاس$"))
-        async def dice_handler(_, message):
-            await client.send_dice(message.chat.id, "🎲")
+    async def get_session(self, user_id):
+        return await self.run(
+            lambda c: c.execute("SELECT * FROM sessions WHERE user_id=?", (user_id,)).fetchone()
+        )
 
-        @client.on_message(filters.me & filters.regex(r"^بولینگ$"))
-        async def bowling_handler(_, message):
-            await client.send_dice(message.chat.id, "🎳")
+    async def all_sessions(self):
+        return await self.run(lambda c: c.execute("SELECT * FROM sessions ORDER BY id DESC").fetchall()
+                              if False else c.execute("SELECT * FROM sessions ORDER BY created_at DESC").fetchall())
 
-        tasks = [
-            asyncio.create_task(update_clock(client, me.id)),
-        ]
+    async def delete_session(self, user_id):
+        await self.run(lambda c: c.execute("DELETE FROM sessions WHERE user_id=?", (user_id,)))
 
-        ACTIVE_BOTS[me.id] = (client, tasks)
-        db.start_subscription(me.id)
+    async def add_target(self, table, user_id, target_id):
+        if table not in {"enemy_users", "muted_users", "blocked_users"}:
+            raise ValueError("Invalid target table")
+        await self.run(lambda c: c.execute(
+            f"INSERT OR IGNORE INTO {table}(user_id,target_id) VALUES(?,?)",
+            (user_id, target_id)
+        ))
 
-        logging.info("Userbot started: %s", me.id)
-        return True
+    async def remove_target(self, table, user_id, target_id):
+        if table not in {"enemy_users", "muted_users", "blocked_users"}:
+            raise ValueError("Invalid target table")
+        await self.run(lambda c: c.execute(
+            f"DELETE FROM {table} WHERE user_id=? AND target_id=?",
+            (user_id, target_id)
+        ))
 
-    except Exception as exc:
-        logging.exception("Failed to start userbot %s: %s", user_id, exc)
+    async def has_target(self, table, user_id, target_id):
+        if table not in {"enemy_users", "muted_users", "blocked_users"}:
+            raise ValueError("Invalid target table")
+        row = await self.run(lambda c: c.execute(
+            f"SELECT 1 FROM {table} WHERE user_id=? AND target_id=?",
+            (user_id, target_id)
+        ).fetchone())
+        return bool(row)
 
+    async def list_enemies(self, user_id):
+        return await self.run(lambda c: c.execute(
+            "SELECT target_id FROM enemy_users WHERE user_id=? ORDER BY target_id",
+            (user_id,)
+        ).fetchall())
+
+    async def set_reaction(self, user_id, target_id, reaction):
+        await self.run(lambda c: c.execute("""
+            INSERT INTO reactions(user_id,target_id,reaction)
+            VALUES(?,?,?)
+            ON CONFLICT(user_id,target_id) DO UPDATE SET reaction=excluded.reaction
+        """, (user_id, target_id, reaction)))
+
+    async def remove_reaction(self, user_id, target_id):
+        await self.run(lambda c: c.execute(
+            "DELETE FROM reactions WHERE user_id=? AND target_id=?", (user_id, target_id)
+        ))
+
+    async def get_reaction(self, user_id, target_id):
+        return await self.run(lambda c: c.execute(
+            "SELECT reaction FROM reactions WHERE user_id=? AND target_id=?",
+            (user_id, target_id)
+        ).fetchone())
+
+    async def create_payment(self, user_id, diamonds, toman):
+        payment_id = uuid.uuid4().hex[:16].upper()
+        await self.run(lambda c: c.execute("""
+            INSERT INTO payments(payment_id,user_id,diamond_amount,amount_toman,status,created_at)
+            VALUES(?,?,?,?, 'PENDING',?)
+        """, (payment_id, user_id, diamonds, toman, now_iso())))
+        return payment_id
+
+    async def get_payment(self, payment_id):
+        return await self.run(lambda c: c.execute(
+            "SELECT * FROM payments WHERE payment_id=?", (payment_id,)
+        ).fetchone())
+
+    async def review_payment(self, payment_id, admin_id, approved):
+        def fn(conn):
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                p = conn.execute(
+                    "SELECT * FROM payments WHERE payment_id=?", (payment_id,)
+                ).fetchone()
+                if not p:
+                    conn.execute("ROLLBACK")
+                    return None, "NOT_FOUND"
+                if p["status"] != "PENDING":
+                    conn.execute("ROLLBACK")
+                    return p, "ALREADY_REVIEWED"
+                status = "APPROVED" if approved else "REJECTED"
+                t = now_iso()
+                conn.execute("""
+                    UPDATE payments SET status=?,reviewed_at=?,reviewed_by=?
+                    WHERE payment_id=? AND status='PENDING'
+                """, (status, t, admin_id, payment_id))
+                if approved:
+                    row = conn.execute(
+                        "SELECT balance FROM wallets WHERE user_id=?", (p["user_id"],)
+                    ).fetchone()
+                    before = Decimal(row["balance"])
+                    after = before + Decimal(p["diamond_amount"])
+                    conn.execute(
+                        "UPDATE wallets SET balance=? WHERE user_id=?",
+                        (str(after), p["user_id"])
+                    )
+                    conn.execute("""
+                        INSERT INTO transactions(
+                            user_id,tx_type,amount,balance_after,description,created_at
+                        ) VALUES(?,?,?,?,?,?)
+                    """, (
+                        p["user_id"], "PURCHASE", str(p["diamond_amount"]),
+                        str(after), f"Payment {payment_id}", t
+                    ))
+                conn.execute("COMMIT")
+                return p, status
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        return await self.run(fn)
+
+    async def attach_receipt(self, payment_id, file_id):
+        await self.run(lambda c: c.execute(
+            "UPDATE payments SET receipt_file_id=? WHERE payment_id=? AND status='PENDING'",
+            (file_id, payment_id)
+        ))
+
+    async def referral_create(self, user_id, phone, referrer_id):
+        await self.run(lambda c: c.execute("""
+            INSERT OR IGNORE INTO referrals(
+                user_id,phone,referrer_id,registration_status,reward_status,created_at
+            ) VALUES(?,?,?,'PENDING','UNPAID',?)
+        """, (user_id, phone, referrer_id, now_iso())))
+
+    async def referral_reward(self, user_id, phone):
+        if not phone or not phone.startswith("+98"):
+            return False
+        def fn(conn):
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                r = conn.execute(
+                    "SELECT * FROM referrals WHERE user_id=?", (user_id,)
+                ).fetchone()
+                if not r or not r["referrer_id"] or r["reward_status"] == "PAID":
+                    conn.execute("ROLLBACK")
+                    return False
+                if r["referrer_id"] == user_id:
+                    conn.execute("ROLLBACK")
+                    return False
+                conn.execute("""
+                    UPDATE referrals
+                    SET phone=?,registration_status='VERIFIED',reward_status='PAID'
+                    WHERE user_id=? AND reward_status='UNPAID'
+                """, (phone, user_id))
+                row = conn.execute(
+                    "SELECT balance FROM wallets WHERE user_id=?", (r["referrer_id"],)
+                ).fetchone()
+                if not row:
+                    conn.execute("ROLLBACK")
+                    return False
+                before = Decimal(row["balance"])
+                after = before + Decimal("25")
+                conn.execute(
+                    "UPDATE wallets SET balance=? WHERE user_id=?",
+                    (str(after), r["referrer_id"])
+                )
+                conn.execute("""
+                    INSERT INTO transactions(
+                        user_id,tx_type,amount,balance_after,description,created_at
+                    ) VALUES(?,?,?,?,?,?)
+                """, (
+                    r["referrer_id"], "REFERRAL", "25", str(after),
+                    f"Referral user {user_id}", now_iso()
+                ))
+                conn.execute("COMMIT")
+                return True
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        return await self.run(fn)
+
+    async def admin_log(self, admin_id, action, target_user_id=None, details=""):
+        await self.run(lambda c: c.execute("""
+            INSERT INTO admin_logs(admin_id,action,target_user_id,details,created_at)
+            VALUES(?,?,?,?,?)
+        """, (admin_id, action, target_user_id, safe_text(details, 3000), now_iso())))
+
+    async def error_log(self, level, module, user_id, session_id, exc):
+        tb = traceback.format_exc() if exc is None else "".join(
+            traceback.format_exception(type(exc), exc, exc.__traceback__)
+        )
+        await self.run(lambda c: c.execute("""
+            INSERT INTO error_logs(
+                level,module,user_id,session_id,exception_type,exception_message,traceback,created_at
+            ) VALUES(?,?,?,?,?,?,?,?)
+        """, (
+            level, module, user_id, session_id,
+            type(exc).__name__ if exc else "Unknown",
+            str(exc) if exc else "",
+            tb, now_iso()
+        )))
+
+    async def recent_errors(self, limit=10):
+        return await self.run(lambda c: c.execute("""
+            SELECT * FROM error_logs ORDER BY id DESC LIMIT ?
+        """, (limit,)).fetchall())
+
+    async def clear_errors(self):
+        await self.run(lambda c: c.execute("DELETE FROM error_logs"))
+
+    async def stats(self):
+        def fn(c):
+            return {
+                "users": c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"],
+                "sessions": c.execute("SELECT COUNT(*) n FROM sessions").fetchone()["n"],
+                "active_sessions": c.execute(
+                    "SELECT COUNT(*) n FROM sessions WHERE status='RUNNING'"
+                ).fetchone()["n"],
+                "diamonds": c.execute(
+                    "SELECT COALESCE(SUM(CAST(balance AS REAL)),0) n FROM wallets"
+                ).fetchone()["n"],
+                "transactions": c.execute("SELECT COUNT(*) n FROM transactions").fetchone()["n"],
+                "pending": c.execute(
+                    "SELECT COUNT(*) n FROM payments WHERE status='PENDING'"
+                ).fetchone()["n"],
+                "referrals": c.execute(
+                    "SELECT COUNT(*) n FROM referrals WHERE reward_status='PAID'"
+                ).fetchone()["n"],
+            }
+        return await self.run(fn)
+
+    async def all_user_ids(self):
+        return await self.run(lambda c: [
+            r["user_id"] for r in c.execute(
+                "SELECT user_id FROM users WHERE is_banned=0"
+            ).fetchall()
+        ])
+
+    async def set_banned(self, user_id, banned):
+        await self.run(lambda c: c.execute(
+            "UPDATE users SET is_banned=? WHERE user_id=?", (int(banned), user_id)
+        ))
+
+
+class SecretStore:
+    def __init__(self):
+        key = os.getenv("SESSION_ENCRYPTION_KEY", "").strip()
+        if not key:
+            raise RuntimeError("SESSION_ENCRYPTION_KEY is missing")
         try:
-            await client.stop()
-        except Exception:
-            pass
+            self.fernet = Fernet(key.encode())
+        except Exception as exc:
+            raise RuntimeError("SESSION_ENCRYPTION_KEY is not a valid Fernet key") from exc
 
-        return False
+    def encrypt(self, value):
+        return self.fernet.encrypt(value.encode()).decode()
+
+    def decrypt(self, value):
+        return self.fernet.decrypt(value.encode()).decode()
 
 
-# ============================================================
-# Manager bot
-# ============================================================
-
-manager_bot = Client(
+db = DB(DB_PATH)
+secret_store = SecretStore()
+manager = Client(
     "husterix_manager",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
+    in_memory=True
 )
 
+selfbots = {}
+selfbot_tasks = {}
+login_states = {}
+purchase_states = {}
+broadcast_states = {}
+secretary_last_reply = defaultdict(dict)
+enemy_queues = defaultdict(lambda: deque(maxlen=ENEMY_REPLY_LIMIT))
 
-# ============================================================
-# UI
-# ============================================================
+ENEMY_REPLIES = [
+    "پیام شما دریافت شد.",
+    "فعلاً پاسخی ندارم.",
+    "بعداً بررسی می‌کنم.",
+    "باشه.",
+    "متوجه شدم."
+]
 
-def main_keyboard():
-    return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton("💎 کیف پول"), KeyboardButton("💎 خرید الماس")],
-            [KeyboardButton("👥 دعوت دوستان"), KeyboardButton("📜 تراکنش‌ها")],
-            [KeyboardButton("🚀 فعال‌سازی سلف")],
-        ],
-        resize_keyboard=True,
-    )
-
-
-def admin_keyboard():
-    return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton("📊 وضعیت ربات"), KeyboardButton("💳 پرداخت‌های در انتظار")],
-            [KeyboardButton("📢 پیام همگانی")],
-        ],
-        resize_keyboard=True,
-    )
+FONT_MAP = {
+    "normal": "0123456789",
+    "cursive": "𝟙𝟚𝟛𝟜𝟝𝟞𝟟𝟠𝟡𝟘",
+    "stylized": "𝟣𝟤𝟥𝟦𝟧𝟨𝟩𝟪𝟫𝟢",
+    "doublestruck": "𝟙𝟚𝟛𝟜𝟝𝟞𝟟𝟠𝟡𝟘",
+    "monospace": "𝟷𝟸𝟹𝟺𝟻𝟼𝟽𝟾𝟿𝟶",
+    "circled": "①②③④⑤⑥⑦⑧⑨⓪",
+    "fullwidth": "１２３４５６７８９０",
+    "filled": "❶❷❸❹❺❻❼❽❾⓿",
+    "sans": "𝟣𝟤𝟥𝟦𝟧𝟨𝟩𝟪𝟫𝟢",
+    "inverted": "0ƖᄅƐㄣϛ9ㄥ8L0"
+}
 
 
-def calculator_markup(value: str):
+def transform_clock(text, font):
+    if font == "normal":
+        return text
+    normal = "0123456789"
+    chars = FONT_MAP.get(font, FONT_MAP["normal"])
+    return text.translate(str.maketrans(normal, chars))
+
+
+def is_admin(user_id):
+    return user_id in GOD_ADMIN_IDS
+
+
+def user_menu():
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("1", callback_data="calc:1"),
-            InlineKeyboardButton("2", callback_data="calc:2"),
-            InlineKeyboardButton("3", callback_data="calc:3"),
-        ],
-        [
-            InlineKeyboardButton("4", callback_data="calc:4"),
-            InlineKeyboardButton("5", callback_data="calc:5"),
-            InlineKeyboardButton("6", callback_data="calc:6"),
-        ],
-        [
-            InlineKeyboardButton("7", callback_data="calc:7"),
-            InlineKeyboardButton("8", callback_data="calc:8"),
-            InlineKeyboardButton("9", callback_data="calc:9"),
-        ],
-        [
-            InlineKeyboardButton("⌫ حذف", callback_data="calc:back"),
-            InlineKeyboardButton("0", callback_data="calc:0"),
-            InlineKeyboardButton("✅ تأیید", callback_data="calc:confirm"),
-        ],
-        [
-            InlineKeyboardButton("❌ لغو", callback_data="calc:cancel"),
-        ],
+        [InlineKeyboardButton("💎 Wallet", callback_data="wallet"),
+         InlineKeyboardButton("🚀 فعال‌سازی سلف", callback_data="self_activate")],
+        [InlineKeyboardButton("🎛 پنل سلف", callback_data="self_panel"),
+         InlineKeyboardButton("💳 خرید الماس", callback_data="buy")],
+        [InlineKeyboardButton("🎁 دعوت دوستان", callback_data="referral"),
+         InlineKeyboardButton("📜 تراکنش‌ها", callback_data="transactions")],
+        [InlineKeyboardButton("📊 وضعیت حساب", callback_data="status"),
+         InlineKeyboardButton("❓ راهنما", callback_data="help")]
     ])
 
 
-def wallet_markup():
+def self_panel(settings):
+    def mark(v):
+        return "🟢" if v else "🔴"
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "💎 خرید الماس",
-                callback_data="buy_diamonds"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "📜 تاریخچه",
-                callback_data="wallet_history"
-            ),
-            InlineKeyboardButton(
-                "👥 رفرال",
-                callback_data="referral"
-            )
-        ],
+        [InlineKeyboardButton(f"⏰ Clock {mark(settings['clock'])}", callback_data="toggle:clock"),
+         InlineKeyboardButton(f"🔤 Font: {settings['font']}", callback_data="fonts")],
+        [InlineKeyboardButton(f"🅱️ Bold {mark(settings['bold'])}", callback_data="toggle:bold"),
+         InlineKeyboardButton(f"🤵 Secretary {mark(settings['secretary'])}", callback_data="toggle:secretary")],
+        [InlineKeyboardButton(f"👁 Auto Seen {mark(settings['auto_seen'])}", callback_data="toggle:auto_seen"),
+         InlineKeyboardButton(f"🔒 PV Lock {mark(settings['pv_lock'])}", callback_data="toggle:pv_lock")],
+        [InlineKeyboardButton(f"🛡 Anti Login {mark(settings['anti_login'])}", callback_data="toggle:anti_login"),
+         InlineKeyboardButton(f"⌨️ Typing {mark(settings['typing'])}", callback_data="toggle:typing")],
+        [InlineKeyboardButton(f"🎮 Playing {mark(settings['playing'])}", callback_data="toggle:playing"),
+         InlineKeyboardButton(f"🌎 Global Enemy {mark(settings['global_enemy'])}", callback_data="toggle:global_enemy")],
+        [InlineKeyboardButton("🌐 Translation", callback_data="translation"),
+         InlineKeyboardButton(f"👤 Copy Identity {mark(settings['copy_mode'])}", callback_data="copy_info")],
+        [InlineKeyboardButton("⚔️ Enemy List", callback_data="enemy_list"),
+         InlineKeyboardButton("🔄 Refresh", callback_data="self_panel_refresh")],
+        [InlineKeyboardButton("🔙 منوی اصلی", callback_data="home")]
     ])
 
 
-# ============================================================
-# Manager / start
-# ============================================================
-
-@manager_bot.on_message(filters.command("start") & filters.private)
-async def start_handler(client, message: Message):
-    uid = message.from_user.id
-
-    db.ensure_user(
-        uid,
-        first_name=message.from_user.first_name or "",
-        username=message.from_user.username or "",
-    )
-
-    referral_code = None
-    if len(message.command) > 1:
-        payload = message.command[1]
-        if payload.startswith("ref_"):
-            raw = payload[4:]
-            if raw.isdigit():
-                referral_code = int(raw)
-
-    if referral_code and referral_code != uid:
-        LOGIN_STATES[uid] = {
-            "referrer": referral_code,
-            "awaiting_contact": True,
-        }
-
-        await message.reply_text(
-            "👥 دعوت با موفقیت شناسایی شد.\n\n"
-            "برای فعال شدن پاداش رفرال، ابتدا شماره تلفن خودت را "
-            "با دکمه زیر ارسال کن.\n\n"
-            "فقط شماره‌های +98 واجد شرایط هستند.",
-            reply_markup=ReplyKeyboardMarkup(
-                [[KeyboardButton(
-                    "📱 تأیید شماره برای رفرال",
-                    request_contact=True
-                )]],
-                resize_keyboard=True,
-                one_time_keyboard=True,
-            ),
-        )
-        return
-
-    buttons = [
-        [KeyboardButton("📱 شماره و شروع", request_contact=True)],
-        [KeyboardButton("💎 کیف پول"), KeyboardButton("💎 خرید الماس")],
-        [KeyboardButton("👥 دعوت دوستان"), KeyboardButton("📜 تراکنش‌ها")],
-        [KeyboardButton("🚀 فعال‌سازی سلف")],
-    ]
-
-    if uid in GOD_ADMIN_IDS:
-        buttons.append(
-            [KeyboardButton("📊 وضعیت ربات"), KeyboardButton("💳 پرداخت‌های در انتظار")]
-        )
-        buttons.append([KeyboardButton("📢 پیام همگانی")])
-
-    await message.reply_text(
-        "⚡️ **HusteRIX**\n\n"
-        "به پنل مدیریت خوش آمدید.\n\n"
-        "💎 اقتصاد داخلی HusteRIX فعال است.\n"
-        f"⏱ هزینه استفاده: {format_diamonds(HOURLY_COST)} 💎/ساعت",
-        reply_markup=ReplyKeyboardMarkup(
-            buttons,
-            resize_keyboard=True,
-        ),
-    )
+def admin_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👥 Users", callback_data="admin_users"),
+         InlineKeyboardButton("🤖 Sessions", callback_data="admin_sessions")],
+        [InlineKeyboardButton("💳 Payments", callback_data="admin_payments"),
+         InlineKeyboardButton("💎 Wallet", callback_data="admin_wallet")],
+        [InlineKeyboardButton("📊 Statistics", callback_data="admin_stats"),
+         InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast")],
+        [InlineKeyboardButton("📋 Logs", callback_data="admin_logs"),
+         InlineKeyboardButton("🚫 Ban", callback_data="admin_ban")],
+        [InlineKeyboardButton("🗑 Remove Session", callback_data="admin_remove_session")]
+    ])
 
 
-# ============================================================
-# Referral
-# ============================================================
-
-@manager_bot.on_message(filters.contact & filters.private)
-async def contact_handler(client, message: Message):
-    uid = message.from_user.id
-    contact = message.contact
-
-    phone = normalize_phone(contact.phone_number or "")
-
-    # Telegram request_contact should normally be the user's own contact.
-    if contact.user_id and contact.user_id != uid:
-        await message.reply_text(
-            "❌ لطفاً شماره خودت را با دکمه ارسال شماره بفرست.",
-            reply_markup=main_keyboard(),
-        )
-        return
-
-    state = LOGIN_STATES.get(uid, {})
-
-    if state.get("awaiting_contact"):
-        referrer = int(state.get("referrer", 0))
-
-        if not is_iranian_phone(phone):
-            await message.reply_text(
-                "❌ این شماره +98 نیست.\n"
-                "پاداش رفرال فقط برای شماره‌های ایران فعال است.",
-                reply_markup=main_keyboard(),
-            )
-            return
-
-        if referrer == uid:
-            await message.reply_text(
-                "❌ نمی‌توانی خودت را رفرال خودت کنی.",
-                reply_markup=main_keyboard(),
-            )
-            return
-
-        created = db.create_referral(referrer, uid, phone)
-
-        if not created:
-            await message.reply_text(
-                "⚠️ این شماره/اکانت قبلاً برای رفرال ثبت شده یا شرایط دریافت پاداش را ندارد.",
-                reply_markup=main_keyboard(),
-            )
-            return
-
-        # The referral is only rewarded after the invitee successfully
-        # completes userbot login.
-        LOGIN_STATES[uid] = {
-            "step": "phone_for_login",
-            "phone": phone,
-            "referrer": referrer,
-        }
-
-        await message.reply_text(
-            "✅ شماره ایران تأیید شد.\n\n"
-            "برای نهایی شدن رفرال، باید Userbot خودت را فعال کنی.\n"
-            "شماره همین حالا برای ورود آماده است.",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-
-        await begin_login(client, message, phone)
-        return
-
-    # Normal login flow.
-    await begin_login(client, message, phone)
+async def ensure_manager_user(client, message):
+    u = message.from_user
+    await db.ensure_user(u.id, u.username, u.first_name)
+    return await db.get_user(u.id)
 
 
-async def begin_login(manager, message: Message, phone: str):
-    uid = message.from_user.id
-
-    await message.reply_text(
-        "⏳ در حال اتصال به تلگرام...",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-
-    user_client = Client(
-        f"login_{uid}_{secrets.token_hex(3)}",
-        api_id=API_ID,
-        api_hash=API_HASH,
-        in_memory=True,
-        no_updates=True,
-    )
-
+async def safe_answer(query, text=None, alert=False):
     try:
-        await user_client.connect()
+        await query.answer(text or "", show_alert=alert)
+    except Exception:
+        pass
 
-        sent = await user_client.send_code(phone)
 
-        state = LOGIN_STATES.get(uid, {})
-        state.update({
-            "step": "code",
-            "phone": phone,
-            "client": user_client,
-            "hash": sent.phone_code_hash,
-        })
-        LOGIN_STATES[uid] = state
+async def send_error_to_db(exc, module, user_id=None, session_id=None):
+    try:
+        await db.error_log("ERROR", module, user_id, session_id, exc)
+    except Exception:
+        pass
+    log_exception(module, user_id=user_id, session_id=session_id, exc=exc)
 
+
+async def home_message(message):
+    await ensure_manager_user(manager, message)
+    text = (
+        "🤖 <b>HusteRIX</b>\n\n"
+        "مدیریت Multi-Session، Wallet و SelfBot\n\n"
+        "یک گزینه را انتخاب کنید:"
+    )
+    await message.reply_text(text, reply_markup=user_menu())
+
+
+@manager.on_message(filters.command("start"))
+async def start_handler(client, message):
+    try:
+        await ensure_manager_user(client, message)
+        ref = None
+        if len(message.command) > 1:
+            ref = require_int(message.command[1].replace("ref_", ""))
+        if ref and ref != message.from_user.id:
+            ref_user = await db.get_user(ref)
+            if ref_user:
+                await db.referral_create(message.from_user.id, None, ref)
+        await home_message(message)
+    except Exception as exc:
+        await send_error_to_db(exc, "start_handler", message.from_user.id)
+
+
+@manager.on_message(filters.command("admin"))
+async def admin_cmd(client, message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.reply_text("🛡 <b>HusteRIX Admin</b>", reply_markup=admin_menu())
+
+
+@manager.on_message(filters.command("panel"))
+async def panel_cmd(client, message):
+    try:
+        await ensure_manager_user(client, message)
         await message.reply_text(
-            "📩 کد ورود تلگرام را ارسال کن.\n\n"
-            "مثال: `12345`"
+            "🤖 <b>HusteRIX</b>\n\nپنل اصلی:",
+            reply_markup=user_menu()
         )
+    except Exception as exc:
+        await send_error_to_db(exc, "panel_cmd", message.from_user.id)
+
+
+@manager.on_callback_query(filters.regex("^home$"))
+async def home_cb(client, query):
+    try:
+        await safe_answer(query)
+        await query.message.edit_text(
+            "🤖 <b>HusteRIX</b>\n\nمدیریت سیستم:",
+            reply_markup=user_menu()
+        )
+    except Exception as exc:
+        await send_error_to_db(exc, "home_cb", query.from_user.id)
+
+
+@manager.on_callback_query(filters.regex("^wallet$"))
+async def wallet_cb(client, query):
+    try:
+        bal = await db.get_wallet(query.from_user.id)
+        await safe_answer(query)
+        await query.message.edit_text(
+            f"💎 <b>Wallet</b>\n\nموجودی: <b>{fmt_diamond(bal)} Diamond</b>",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💳 شارژ Wallet", callback_data="buy")],
+                [InlineKeyboardButton("📜 تراکنش‌ها", callback_data="transactions")],
+                [InlineKeyboardButton("🔙 بازگشت", callback_data="home")]
+            ])
+        )
+    except Exception as exc:
+        await send_error_to_db(exc, "wallet_cb", query.from_user.id)
+
+
+@manager.on_callback_query(filters.regex("^transactions$"))
+async def transactions_cb(client, query):
+    try:
+        rows = await db.transactions(query.from_user.id, 15)
+        lines = ["📜 <b>تراکنش‌ها</b>", ""]
+        if not rows:
+            lines.append("هنوز تراکنشی ثبت نشده است.")
+        for r in rows:
+            sign = "+" if Decimal(r["amount"]) >= 0 else ""
+            lines.append(
+                f"{sign}{fmt_diamond(r['amount'])} 💎 | {r['tx_type']}\n"
+                f"💰 {fmt_diamond(r['balance_after'])} | {r['created_at'][:19]}"
+            )
+        await safe_answer(query)
+        await query.message.edit_text(
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="home")]])
+        )
+    except Exception as exc:
+        await send_error_to_db(exc, "transactions_cb", query.from_user.id)
+
+
+@manager.on_callback_query(filters.regex("^status$"))
+async def status_cb(client, query):
+    try:
+        user = await db.get_user(query.from_user.id)
+        session = await db.get_session(query.from_user.id)
+        bal = await db.get_wallet(query.from_user.id)
+        text = (
+            "📊 <b>وضعیت حساب</b>\n\n"
+            f"👤 ID: <code>{user['user_id']}</code>\n"
+            f"💎 Wallet: <b>{fmt_diamond(bal)}</b>\n"
+            f"🤖 SelfBot: <b>{session['status'] if session else 'NOT_CONNECTED'}</b>\n"
+            f"📅 عضویت: {user['created_at'][:19]}"
+        )
+        await safe_answer(query)
+        await query.message.edit_text(text, reply_markup=user_menu())
+    except Exception as exc:
+        await send_error_to_db(exc, "status_cb", query.from_user.id)
+
+
+@manager.on_callback_query(filters.regex("^help$"))
+async def help_cb(client, query):
+    text = (
+        "❓ <b>راهنمای HusteRIX</b>\n\n"
+        "🚀 فعال‌سازی سلف: اتصال Session اکانت شما\n"
+        "🎛 پنل سلف: کنترل قابلیت‌های Session\n"
+        "💳 خرید الماس: کارت‌به‌کارت و ارسال فیش\n\n"
+        "<b>دستورات SelfBot:</b>\n"
+        "دشمن روشن / دشمن خاموش\n"
+        "سکوت روشن / سکوت خاموش\n"
+        "بلاک روشن / بلاک خاموش\n"
+        "ریاکشن ❤️ / ریاکشن خاموش\n"
+        "لیست دشمن\nذخیره\nتکرار N\nحذف N\nتاس\nبولینگ\n"
+        "کپی روشن / کپی خاموش"
+    )
+    await safe_answer(query)
+    await query.message.edit_text(text, reply_markup=user_menu())
+
+
+@manager.on_callback_query(filters.regex("^referral$"))
+async def referral_cb(client, query):
+    username = BOT_USERNAME
+    if not username:
+        me = await manager.get_me()
+        username = me.username or ""
+    link = f"https://t.me/{username}?start=ref_{query.from_user.id}"
+    text = (
+        "🎁 <b>دعوت دوستان</b>\n\n"
+        "با دعوت کاربر واقعی ایرانی که شماره خود را با موفقیت تأیید کند، "
+        "<b>25 Diamond</b> دریافت می‌کنید.\n\n"
+        f"🔗 <code>{link}</code>"
+    )
+    await safe_answer(query)
+    await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 بازگشت", callback_data="home")]
+    ]))
+
+
+@manager.on_callback_query(filters.regex("^self_activate$"))
+async def self_activate_cb(client, query):
+    try:
+        session = await db.get_session(query.from_user.id)
+        if session and session["status"] == "RUNNING":
+            await safe_answer(query, "SelfBot شما فعال است.", True)
+            return
+        login_states[query.from_user.id] = {"step": "phone", "created": time.monotonic()}
+        await safe_answer(query)
+        await query.message.edit_text(
+            "🚀 <b>فعال‌سازی SelfBot</b>\n\n"
+            "شماره تلفن اکانت Telegram را با فرمت بین‌المللی ارسال کنید.\n"
+            "مثال: <code>+989121234567</code>\n\n"
+            "⚠️ کد ورود و رمز دو مرحله‌ای فقط در همین گفت‌وگو و برای اتصال Session استفاده می‌شود."
+        )
+    except Exception as exc:
+        await send_error_to_db(exc, "self_activate_cb", query.from_user.id)
+
+
+@manager.on_message(filters.private & ~filters.service)
+async def manager_text_flow(client, message):
+    uid = message.from_user.id
+    try:
+        await ensure_manager_user(client, message)
+
+        state = login_states.get(uid)
+        if state and time.monotonic() - state["created"] > 600:
+            login_states.pop(uid, None)
+            state = None
+
+        if state:
+            await handle_login_input(message, state)
+            return
+
+        pstate = purchase_states.get(uid)
+        if pstate:
+            await handle_purchase_input(message, pstate)
+            return
+
+        bstate = broadcast_states.get(uid)
+        if bstate:
+            await handle_broadcast_input(message, bstate)
+            return
 
     except Exception as exc:
-        try:
-            await user_client.disconnect()
-        except Exception:
-            pass
-
-        LOGIN_STATES.pop(uid, None)
-
-        await message.reply_text(
-            f"❌ خطا در ارسال کد:\n`{exc}`",
-            reply_markup=main_keyboard(),
-        )
+        await send_error_to_db(exc, "manager_text_flow", uid)
 
 
-# ============================================================
-# Login code / 2FA
-# ============================================================
-
-@manager_bot.on_message(filters.text & filters.private, group=5)
-async def login_text_handler(client, message: Message):
+async def handle_login_input(message, state):
     uid = message.from_user.id
-    state = LOGIN_STATES.get(uid)
-
-    if not state:
+    text = (message.text or "").strip()
+    if state["step"] == "phone":
+        if not re.fullmatch(r"\+\d{8,15}", text):
+            await message.reply_text("❌ شماره معتبر نیست. مثال: <code>+989121234567</code>")
+            return
+        try:
+            login = Client(
+                f"husterix_login_{uid}",
+                api_id=API_ID,
+                api_hash=API_HASH,
+                in_memory=True
+            )
+            await login.connect()
+            sent = await login.send_code(text)
+            state.update({
+                "step": "code",
+                "phone": text,
+                "phone_code_hash": sent.phone_code_hash,
+                "client": login,
+                "created": time.monotonic()
+            })
+            await message.reply_text(
+                "📨 کد ورود Telegram ارسال شد.\n\n"
+                "کد را همینجا ارسال کنید. برای امنیت، کد را با فاصله هم می‌توانید وارد کنید."
+            )
+        except Exception as exc:
+            await send_error_to_db(exc, "login_send_code", uid)
+            await message.reply_text(f"❌ ارسال کد ناموفق بود: <code>{safe_text(exc)}</code>")
+            try:
+                await login.disconnect()
+            except Exception:
+                pass
+            login_states.pop(uid, None)
         return
 
-    step = state.get("step")
-
-    if step == "code":
-        code = re.sub(r"\D", "", message.text or "")
-
+    if state["step"] == "code":
+        code = re.sub(r"\D", "", text)
         if len(code) < 4:
             await message.reply_text("❌ کد ورود نامعتبر است.")
             return
-
-        user_client = state["client"]
-
+        login = state["client"]
         try:
-            await user_client.sign_in(
-                state["phone"],
-                state["hash"],
-                code,
+            await login.sign_in(
+                state["phone"], state["phone_code_hash"], code
             )
-
-            await finalize_login(message, user_client, state)
-
         except SessionPasswordNeeded:
             state["step"] = "password"
-            await message.reply_text(
-                "🔐 رمز دو مرحله‌ای تلگرام را ارسال کن:"
-            )
-
+            await message.reply_text("🔐 Two-Step Verification فعال است. رمز را ارسال کنید.")
+            return
+        except (PhoneCodeInvalid, PhoneCodeExpired) as exc:
+            await message.reply_text("❌ کد ورود نادرست یا منقضی شده است.")
+            await send_error_to_db(exc, "login_sign_in", uid)
+            return
         except Exception as exc:
-            await message.reply_text(
-                f"❌ خطا در ورود:\n`{exc}`"
-            )
+            await send_error_to_db(exc, "login_sign_in", uid)
+            await message.reply_text("❌ ورود ناموفق بود.")
+            await login.disconnect()
+            login_states.pop(uid, None)
+            return
+        await finalize_login(uid, login, state["phone"])
+        return
 
-    elif step == "password":
-        user_client = state["client"]
-
+    if state["step"] == "password":
+        login = state["client"]
         try:
-            await user_client.check_password(message.text)
-            await finalize_login(message, user_client, state)
-
+            await login.check_password(text)
+            await finalize_login(uid, login, state["phone"])
         except Exception as exc:
-            await message.reply_text(
-                f"❌ خطا در رمز دو مرحله‌ای:\n`{exc}`"
-            )
+            await send_error_to_db(exc, "login_password", uid)
+            await message.reply_text("❌ رمز دو مرحله‌ای نادرست است.")
 
 
-async def finalize_login(message: Message, user_client: Client, state: dict):
-    uid = message.from_user.id
-
+async def finalize_login(uid, client, phone):
     try:
-        session_string = await user_client.export_session_string()
-        me = await user_client.get_me()
-
-        phone = normalize_phone(state["phone"])
-
-        db.ensure_user(
-            me.id,
-            phone=phone,
-            first_name=me.first_name or "",
-            username=me.username or "",
+        me = await client.get_me()
+        session_string = await client.export_session_string()
+        encrypted = secret_store.encrypt(session_string)
+        sid = uuid.uuid4().hex
+        await db.set_session(
+            uid, sid, encrypted, phone,
+            f"@{me.username}" if me.username else me.first_name,
+            "STOPPED"
         )
-
-        # Store session.
-        with db.connect() as conn:
-            conn.execute("""
-                UPDATE users
-                SET session_string=?, phone=?, first_name=?, username=?, updated_at=?
-                WHERE user_id=?
-            """, (
-                session_string,
-                phone,
-                me.first_name or "",
-                me.username or "",
-                now_iso(),
-                me.id,
-            ))
-
+        await client.disconnect()
+        login_states.pop(uid, None)
+        await db.ensure_user(uid, phone=phone)
+        await db.referral_reward(uid, phone)
+        await start_selfbot(uid)
+        if uid in selfbots:
+            await configure_selfbot_handlers(uid, selfbots[uid])
+        await manager.send_message(
+            uid,
+            "✅ <b>SelfBot با موفقیت فعال شد.</b>\n\n"
+            f"👤 {me.first_name}\n"
+            f"📱 {phone}\n\n"
+            "💎 هزینه استفاده: 2.5 Diamond / Hour",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🎛 پنل سلف", callback_data="self_panel")],
+                [InlineKeyboardButton("🔙 منوی اصلی", callback_data="home")]
+            ])
+        )
+    except Exception as exc:
+        await send_error_to_db(exc, "finalize_login", uid)
         try:
-            await user_client.disconnect()
+            await client.disconnect()
         except Exception:
             pass
+        login_states.pop(uid, None)
+        await manager.send_message(uid, "❌ ساخت Session ناموفق بود.")
 
-        referrer = state.get("referrer")
 
-        # Referral reward is granted only after successful Telegram login.
-        if referrer and is_iranian_phone(phone):
-            result = db.verify_referral(me.id)
+async def start_selfbot(user_id):
+    if user_id in selfbots:
+        return True
+    row = await db.get_session(user_id)
+    if not row:
+        return False
+    try:
+        session_string = secret_store.decrypt(row["encrypted_session"])
+        app = Client(
+            f"husterix_{user_id}",
+            api_id=API_ID,
+            api_hash=API_HASH,
+            session_string=session_string,
+            in_memory=True,
+            no_updates=False
+        )
+        await app.start()
+        me = await app.get_me()
+        selfbots[user_id] = app
+        await db.update_session(
+            row["session_id"],
+            status="RUNNING",
+            username=f"@{me.username}" if me.username else me.first_name,
+            last_seen=now_iso()
+        )
+        await configure_selfbot_handlers(user_id, app)
+        task = asyncio.create_task(selfbot_maintenance(user_id, app))
+        selfbot_tasks[user_id] = task
+        return True
+    except Exception as exc:
+        await send_error_to_db(exc, "start_selfbot", user_id, row["session_id"])
+        await db.update_session(row["session_id"], status="ERROR")
+        return False
 
-            if result:
-                try:
-                    await manager_bot.send_message(
-                        result["inviter_id"],
-                        "🎉 **رفرال تأیید شد!**\n\n"
-                        f"👤 کاربر جدید: `{me.id}`\n"
-                        f"💎 پاداش: +{format_diamonds(result['reward'])} الماس\n"
-                        f"💰 موجودی جدید: {format_diamonds(result['balance'])} 💎"
+
+async def stop_selfbot(user_id, remove=False):
+    app = selfbots.pop(user_id, None)
+    task = selfbot_tasks.pop(user_id, None)
+    if task:
+        task.cancel()
+    row = await db.get_session(user_id)
+    if app:
+        try:
+            await app.stop()
+        except Exception as exc:
+            await send_error_to_db(exc, "stop_selfbot", user_id, row["session_id"] if row else None)
+    if row:
+        if remove:
+            await db.delete_session(user_id)
+        else:
+            await db.update_session(row["session_id"], status="STOPPED")
+    return True
+
+
+async def selfbot_maintenance(user_id, app):
+    last_bill = time.monotonic()
+    last_anti = time.monotonic()
+    while user_id in selfbots:
+        try:
+            settings = await db.settings(user_id)
+            if settings and settings["clock"]:
+                me = await app.get_me()
+                base = re.sub(r"\s*𝟷?\d.*$", "", me.first_name or "HusteRIX").strip()
+                tm = tehran_now().strftime("%H:%M")
+                tm = transform_clock(tm, settings["font"])
+                new_name = f"{base} {tm}".strip()
+                if new_name != me.first_name:
+                    try:
+                        await app.update_profile(first_name=new_name[:64])
+                    except RPCError:
+                        pass
+
+            if settings and settings["typing"] and settings["playing"]:
+                await db.update_setting(user_id, "playing", 0)
+
+            if time.monotonic() - last_bill >= BILLING_INTERVAL:
+                ok, balance = await db.wallet_change(
+                    user_id, -HOURLY_RATE, "HOURLY_USAGE", "SelfBot hourly billing"
+                )
+                if not ok:
+                    await stop_selfbot(user_id)
+                    await manager.send_message(
+                        user_id,
+                        f"❌ <b>موجودی Diamond کافی نیست.</b>\n\n"
+                        f"💎 موجودی فعلی: {fmt_diamond(balance)}"
                     )
+                    break
+                last_bill = time.monotonic()
+
+            if settings and settings["anti_login"] and time.monotonic() - last_anti >= ANTI_LOGIN_INTERVAL:
+                # Telegram session authorization monitoring is intentionally read-only.
+                # The current active session is never revoked automatically.
+                try:
+                    await app.invoke(__import__("pyrogram").raw.functions.account.GetAuthorizations())
+                except Exception:
+                    pass
+                last_anti = time.monotonic()
+
+            await db.update_session((await db.get_session(user_id))["session_id"], last_seen=now_iso())
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            await send_error_to_db(exc, "selfbot_maintenance", user_id)
+            await asyncio.sleep(30)
+
+
+async def configure_selfbot_handlers(user_id, app):
+    # Handlers are installed once when the app is created.
+    # Pyrogram permits registering handlers dynamically.
+    @app.on_message(filters.private & ~filters.me)
+    async def private_handler(client, message):
+        try:
+            settings = await db.settings(user_id)
+            if not settings:
+                return
+            target = message.from_user.id if message.from_user else None
+
+            if settings["auto_seen"]:
+                try:
+                    await client.read_history(message.chat.id)
                 except Exception:
                     pass
 
-        LOGIN_STATES.pop(uid, None)
+            if target and await db.has_target("blocked_users", user_id, target):
+                return
 
-        # Start only if user has at least one hour of balance.
-        balance = db.get_balance(me.id)
+            if target and await db.has_target("muted_users", user_id, target):
+                try:
+                    await message.delete()
+                except Exception:
+                    pass
+                return
 
-        if balance >= HOURLY_COST:
-            started = await start_userbot(
-                session_string,
-                phone,
-                me.id,
+            is_enemy = settings["global_enemy"] or (
+                target and await db.has_target("enemy_users", user_id, target)
             )
+            if is_enemy:
+                key = f"{user_id}:{target}"
+                q = enemy_queues[key]
+                reply = ENEMY_REPLIES[secrets.randbelow(len(ENEMY_REPLIES))]
+                if q and reply == q[-1]:
+                    reply = ENEMY_REPLIES[(ENEMY_REPLIES.index(reply) + 1) % len(ENEMY_REPLIES)]
+                q.append(reply)
+                await message.reply_text(reply)
 
-            if started:
-                await message.reply_text(
-                    "✅ **Userbot فعال شد.**\n\n"
-                    f"💎 موجودی: {format_diamonds(balance)}\n"
-                    f"⏱ هزینه: {format_diamonds(HOURLY_COST)} 💎/ساعت\n\n"
-                    "دستور `کیف پول` را در اکانت خودت بفرست.",
-                    reply_markup=main_keyboard(),
-                )
-            else:
-                await message.reply_text(
-                    "⚠️ ورود موفق بود، اما Userbot نتوانست اجرا شود.",
-                    reply_markup=main_keyboard(),
-                )
-        else:
-            await message.reply_text(
-                "✅ شماره و حساب با موفقیت ثبت شد.\n\n"
-                f"💰 موجودی فعلی: {format_diamonds(balance)} 💎\n"
-                f"حداقل موجودی برای اجرا: {format_diamonds(HOURLY_COST)} 💎\n\n"
-                "ابتدا الماس خریداری کن.",
-                reply_markup=main_keyboard(),
-            )
+            if settings["pv_lock"]:
+                try:
+                    await message.delete()
+                except Exception:
+                    pass
+                return
 
-    except Exception as exc:
-        logging.exception("Finalize login error")
-        await message.reply_text(
-            f"❌ خطا در نهایی‌سازی ورود:\n`{exc}`",
-            reply_markup=main_keyboard(),
-        )
+            if settings["secretary"] and target:
+                now = time.monotonic()
+                last = secretary_last_reply[user_id].get(target, 0)
+                if now - last >= SECRETARY_COOLDOWN:
+                    secretary_last_reply[user_id][target] = now
+                    await message.reply_text(settings["secretary_text"])
 
+            reaction = await db.get_reaction(user_id, target) if target else None
+            if reaction:
+                try:
+                    await message.react(reaction["reaction"])
+                except Exception:
+                    pass
+
+            if settings["translation"] and message.text:
+                translated = await translate_text(message.text, settings["translation"])
+                if translated:
+                    out = translated
+                    if settings["bold"]:
+                        out = f"<b>{safe_text(out)}</b>"
+                    await message.reply_text(out)
+
+        except Exception as exc:
+            await send_error_to_db(exc, "selfbot_private_handler", user_id)
+
+    @app.on_message(filters.me)
+    async def outgoing_handler(client, message):
         try:
-            await user_client.disconnect()
-        except Exception:
-            pass
-
-
-# ============================================================
-# Wallet UI
-# ============================================================
-
-@manager_bot.on_message(
-    filters.regex(r"^💎 کیف پول$") & filters.private
-)
-async def wallet_button(client, message: Message):
-    uid = message.from_user.id
-    db.ensure_user(uid)
-
-    balance = db.get_balance(uid)
-    sub = db.get_subscription(uid)
-
-    active = bool(sub and sub["active"])
-
-    await message.reply_text(
-        "💎 **کیف پول HusteRIX**\n\n"
-        f"💰 موجودی: **{format_diamonds(balance)} 💎**\n"
-        f"🟢 وضعیت سلف: {'فعال' if active else 'خاموش'}\n"
-        f"⏱ هزینه: **{format_diamonds(HOURLY_COST)} 💎/ساعت**",
-        reply_markup=wallet_markup(),
-    )
-
-
-@manager_bot.on_callback_query(filters.regex("^wallet_history$"))
-async def wallet_history(client, callback):
-    uid = callback.from_user.id
-    rows = db.get_transactions(uid, 10)
-
-    if not rows:
-        await callback.answer("هنوز تراکنشی ثبت نشده.", show_alert=True)
-        return
-
-    lines = ["📜 **آخرین تراکنش‌ها**", ""]
-
-    for row in rows:
-        amount = float(row["amount"])
-        sign = "+" if amount >= 0 else ""
-        lines.append(
-            f"{sign}{format_diamonds(amount)} 💎 — "
-            f"{row['description']}"
-        )
-
-    await callback.message.edit_text("\n".join(lines))
-
-
-# ============================================================
-# Diamond calculator
-# ============================================================
-
-@manager_bot.on_message(
-    filters.regex(r"^💎 خرید الماس$") & filters.private
-)
-async def buy_diamonds_button(client, message):
-    uid = message.from_user.id
-
-    PURCHASE_STATES[uid] = {"value": ""}
-
-    await message.reply_text(
-        "💎 **خرید الماس**\n\n"
-        "مقدار مورد نظر را با ماشین حساب وارد کن.\n\n"
-        f"حداقل خرید: **{format_number(DIAMOND_MIN)} 💎**\n"
-        f"نرخ: هر **500 💎 = {format_number(DIAMOND_PER_500)} تومان**\n\n"
-        "💎 مقدار فعلی: `0`",
-        reply_markup=calculator_markup(""),
-    )
-
-
-@manager_bot.on_callback_query(filters.regex(r"^buy_diamonds$"))
-async def buy_diamonds_callback(client, callback):
-    uid = callback.from_user.id
-
-    PURCHASE_STATES[uid] = {"value": ""}
-
-    await callback.message.edit_text(
-        "💎 **خرید الماس**\n\n"
-        "مقدار مورد نظر را با ماشین حساب وارد کن.\n\n"
-        f"حداقل خرید: **{format_number(DIAMOND_MIN)} 💎**\n"
-        f"نرخ: هر **500 💎 = {format_number(DIAMOND_PER_500)} تومان**\n\n"
-        "💎 مقدار فعلی: `0`",
-        reply_markup=calculator_markup(""),
-    )
-
-
-@manager_bot.on_callback_query(filters.regex(r"^calc:"))
-async def calculator_callback(client, callback):
-    uid = callback.from_user.id
-    state = PURCHASE_STATES.setdefault(uid, {"value": ""})
-
-    action = callback.data.split(":", 1)[1]
-    value = state.get("value", "")
-
-    if action.isdigit():
-        if len(value) >= 9:
-            await callback.answer("حداکثر 9 رقم.", show_alert=True)
-            return
-
-        if value == "0":
-            value = action
-        else:
-            value += action
-
-        state["value"] = value
-
-    elif action == "back":
-        value = value[:-1]
-        state["value"] = value
-
-    elif action == "cancel":
-        PURCHASE_STATES.pop(uid, None)
-
-        await callback.message.edit_text(
-            "❌ خرید الماس لغو شد."
-        )
-        await callback.answer()
-        return
-
-    elif action == "confirm":
-        if not value:
-            await callback.answer(
-                "ابتدا مقدار الماس را وارد کن.",
-                show_alert=True
-            )
-            return
-
-        diamonds = int(value)
-
-        if diamonds < DIAMOND_MIN:
-            await callback.answer(
-                f"حداقل خرید {format_number(DIAMOND_MIN)} الماس است.",
-                show_alert=True
-            )
-            return
-
-        toman = diamond_price(diamonds)
-        payment_id = db.create_payment(uid, diamonds, toman)
-        db.mark_payment_awaiting_receipt(payment_id)
-
-        PURCHASE_STATES.pop(uid, None)
-
-        await callback.message.edit_text(
-            f"💳 **پرداخت خرید الماس**\n\n"
-            f"💎 مقدار: **{format_number(diamonds)} الماس**\n"
-            f"💰 مبلغ: **{format_number(toman)} تومان**\n\n"
-            "━━━━━━━━━━━━━━\n"
-            f"💳 شماره کارت:\n`{card_display()}`\n\n"
-            f"👤 به نام: **{CARD_OWNER}**\n"
-            "━━━━━━━━━━━━━━\n\n"
-            "لطفاً مبلغ بالا را کارت‌به‌کارت کن و "
-            "بعد از پرداخت، **عکس فیش** را همینجا ارسال کن.\n\n"
-            "⚠️ تا قبل از تأیید ادمین، الماس به Wallet اضافه نمی‌شود.",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "📋 کپی شماره کارت",
-                        callback_data="copy_card"
+            settings = await db.settings(user_id)
+            if not settings or not message.text:
+                return
+            command = message.text.strip()
+            if command == "دشمن روشن" and message.reply_to_message:
+                await db.add_target("enemy_users", user_id, message.reply_to_message.from_user.id)
+                await message.edit("⚔️ دشمن روشن شد.")
+            elif command == "دشمن خاموش" and message.reply_to_message:
+                await db.remove_target("enemy_users", user_id, message.reply_to_message.from_user.id)
+                await message.edit("⚔️ دشمن خاموش شد.")
+            elif command == "لیست دشمن":
+                rows = await db.list_enemies(user_id)
+                await message.edit("⚔️ Enemy List:\n" + (
+                    "\n".join(f"• <code>{r['target_id']}</code>" for r in rows)
+                    if rows else "خالی"
+                ))
+            elif command == "سکوت روشن" and message.reply_to_message:
+                await db.add_target("muted_users", user_id, message.reply_to_message.from_user.id)
+                await message.edit("🔇 سکوت روشن شد.")
+            elif command == "سکوت خاموش" and message.reply_to_message:
+                await db.remove_target("muted_users", user_id, message.reply_to_message.from_user.id)
+                await message.edit("🔊 سکوت خاموش شد.")
+            elif command == "بلاک روشن" and message.reply_to_message:
+                target = message.reply_to_message.from_user.id
+                await db.add_target("blocked_users", user_id, target)
+                try:
+                    await client.block_user(target)
+                except Exception:
+                    pass
+                await message.edit("🚫 بلاک روشن شد.")
+            elif command == "بلاک خاموش" and message.reply_to_message:
+                target = message.reply_to_message.from_user.id
+                await db.remove_target("blocked_users", user_id, target)
+                try:
+                    await client.unblock_user(target)
+                except Exception:
+                    pass
+                await message.edit("✅ بلاک خاموش شد.")
+            elif command.startswith("ریاکشن ") and message.reply_to_message:
+                value = command[8:].strip()
+                if value == "خاموش":
+                    await db.remove_reaction(user_id, message.reply_to_message.from_user.id)
+                    await message.edit("👍 Auto Reaction خاموش شد.")
+                else:
+                    await db.set_reaction(
+                        user_id, message.reply_to_message.from_user.id, value[:8]
                     )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "❌ لغو",
-                        callback_data=f"cancel_payment:{payment_id}"
-                    )
-                ],
-            ]),
+                    await message.edit(f"👍 Auto Reaction {value} فعال شد.")
+            elif command == "ذخیره" and message.reply_to_message:
+                await client.forward_messages(
+                    "me",
+                    message.chat.id,
+                    message.reply_to_message.id
+                )
+                await message.edit("💾 ذخیره شد.")
+            elif command.startswith("تکرار ") and message.reply_to_message:
+                n = require_int(command.split(maxsplit=1)[1])
+                if n and 1 <= n <= MAX_REPEAT:
+                    original = message.reply_to_message
+                    await message.delete()
+                    for _ in range(n):
+                        await original.copy(message.chat.id)
+                        await asyncio.sleep(0.25)
+            elif command.startswith("حذف "):
+                n = require_int(command.split(maxsplit=1)[1])
+                if n and 1 <= n <= MAX_DELETE:
+                    count = 0
+                    async for m in client.get_chat_history(message.chat.id, limit=MAX_DELETE + 5):
+                        if m.from_user and m.from_user.is_self:
+                            try:
+                                await m.delete()
+                                count += 1
+                            except Exception:
+                                pass
+                            if count >= n:
+                                break
+            elif command == "تاس":
+                await client.send_dice(message.chat.id, emoji="🎲")
+                await message.delete()
+            elif command == "بولینگ":
+                await client.send_dice(message.chat.id, emoji="🎳")
+                await message.delete()
+            elif command == "کپی روشن" and message.reply_to_message:
+                await copy_identity(user_id, client, message.reply_to_message.from_user.id)
+                await message.edit("👤 Copy Identity فعال شد.")
+            elif command == "کپی خاموش":
+                await restore_identity(user_id, client)
+                await message.edit("👤 Identity اصلی Restore شد.")
+            elif command == "کپی روشن":
+                await message.edit("❌ باید روی User موردنظر Reply کنید.")
+        except Exception as exc:
+            await send_error_to_db(exc, "selfbot_outgoing_handler", user_id)
+
+
+async def copy_identity(user_id, app, target_id):
+    settings = await db.settings(user_id)
+    me = await app.get_me()
+    target = await app.get_users(target_id)
+    try:
+        full = await app.get_chat(target_id)
+    except Exception:
+        full = None
+    old = {
+        "first_name": me.first_name or "",
+        "last_name": me.last_name or "",
+        "bio": "",
+        "photo_file_id": None
+    }
+    try:
+        full_me = await app.get_chat(me.id)
+        old["bio"] = getattr(full_me, "bio", "") or ""
+    except Exception:
+        pass
+    target_bio = getattr(full, "bio", "") if full else ""
+    saved = json.dumps(old, ensure_ascii=False)
+    await db.update_setting(user_id, "saved_identity", saved)
+    await db.update_setting(user_id, "copy_mode", 1)
+    await db.update_setting(user_id, "clock", 0)
+    await app.update_profile(
+        first_name=(target.first_name or "")[:64],
+        last_name=(target.last_name or "")[:64],
+        bio=target_bio[:70]
+    )
+    try:
+        photos = [p async for p in app.get_chat_photos(target_id, limit=1)]
+        if photos:
+            await app.set_profile_photo(photo=photos[0].file_id)
+    except Exception:
+        pass
+
+
+async def restore_identity(user_id, app):
+    settings = await db.settings(user_id)
+    if not settings or not settings["saved_identity"]:
+        await db.update_setting(user_id, "copy_mode", 0)
+        return
+    old = json.loads(settings["saved_identity"])
+    await app.update_profile(
+        first_name=old.get("first_name", "")[:64],
+        last_name=old.get("last_name", "")[:64],
+        bio=old.get("bio", "")[:70]
+    )
+    await db.update_setting(user_id, "copy_mode", 0)
+
+
+async def translate_text(text, lang):
+    lang = {"en": "en", "ru": "ru", "cn": "zh-CN"}.get(lang, lang)
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.get(
+                "https://translate.googleapis.com/translate_a/single",
+                params={
+                    "client": "gtx", "sl": "auto", "tl": lang,
+                    "dt": "t", "q": text
+                }
+            )
+            r.raise_for_status()
+            data = r.json()
+            return "".join(x[0] for x in data[0] if x and x[0])
+    except Exception as exc:
+        logger.warning("Translation failed: %s", exc)
+        return None
+
+
+@manager.on_callback_query(filters.regex("^self_panel(?:_refresh)?$"))
+async def self_panel_cb(client, query):
+    try:
+        settings = await db.settings(query.from_user.id)
+        if not settings:
+            await safe_answer(query, "ابتدا SelfBot را فعال کنید.", True)
+            return
+        await safe_answer(query)
+        await query.message.edit_text(
+            "🎛 <b>پنل SelfBot</b>\n\nوضعیت قابلیت‌ها:",
+            reply_markup=self_panel(settings)
         )
+    except Exception as exc:
+        await send_error_to_db(exc, "self_panel_cb", query.from_user.id)
 
-        await callback.answer("سفارش پرداخت ایجاد شد.")
+
+@manager.on_callback_query(filters.regex("^toggle:"))
+async def toggle_cb(client, query):
+    try:
+        field = query.data.split(":", 1)[1]
+        settings = await db.settings(query.from_user.id)
+        if field not in {
+            "clock", "bold", "secretary", "auto_seen", "pv_lock",
+            "anti_login", "typing", "playing", "global_enemy"
+        }:
+            return
+        new_value = 0 if settings[field] else 1
+        if field == "typing" and new_value:
+            await db.update_setting(query.from_user.id, "playing", 0)
+        if field == "playing" and new_value:
+            await db.update_setting(query.from_user.id, "typing", 0)
+        await db.update_setting(query.from_user.id, field, new_value)
+        settings = await db.settings(query.from_user.id)
+        await safe_answer(query, "به‌روزرسانی شد")
+        await query.message.edit_reply_markup(self_panel(settings))
+    except Exception as exc:
+        await send_error_to_db(exc, "toggle_cb", query.from_user.id)
+
+
+@manager.on_callback_query(filters.regex("^fonts$"))
+async def fonts_cb(client, query):
+    buttons = []
+    names = list(FONT_MAP.keys())
+    for i in range(0, len(names), 2):
+        buttons.append([
+            InlineKeyboardButton(names[i], callback_data=f"font:{names[i]}"),
+            *([InlineKeyboardButton(names[i+1], callback_data=f"font:{names[i+1]}")]
+               if i + 1 < len(names) else [])
+        ])
+    buttons.append([InlineKeyboardButton("🔙 پنل", callback_data="self_panel")])
+    await safe_answer(query)
+    await query.message.edit_text("🔤 <b>Clock Font</b>", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+@manager.on_callback_query(filters.regex("^font:"))
+async def font_cb(client, query):
+    font = query.data.split(":", 1)[1]
+    if font not in FONT_MAP:
         return
+    await db.update_setting(query.from_user.id, "font", font)
+    await safe_answer(query, f"Font: {font}")
+    await self_panel_cb(client, query)
 
-    if value:
-        diamonds_text = format_number(int(value))
-        if int(value) > 0:
-            toman_text = format_number(diamond_price(int(value)))
-        else:
-            toman_text = "0"
-    else:
-        diamonds_text = "0"
-        toman_text = "0"
 
-    await callback.message.edit_text(
-        "💎 **ماشین حساب خرید الماس**\n\n"
-        f"💎 مقدار: **{diamonds_text}**\n"
-        f"💰 مبلغ: **{toman_text} تومان**\n\n"
-        f"حداقل خرید: {format_number(DIAMOND_MIN)} 💎\n"
-        f"نرخ: هر 500 💎 = {format_number(DIAMOND_PER_500)} تومان",
-        reply_markup=calculator_markup(value),
+@manager.on_callback_query(filters.regex("^translation$"))
+async def translation_cb(client, query):
+    await safe_answer(query)
+    await query.message.edit_text(
+        "🌐 <b>Translation</b>\n\nانتخاب زبان؛ انتخاب مجدد همان زبان = OFF",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🇺🇸 EN", callback_data="lang:en"),
+             InlineKeyboardButton("🇷🇺 RU", callback_data="lang:ru")],
+            [InlineKeyboardButton("🇨🇳 CN", callback_data="lang:cn")],
+            [InlineKeyboardButton("🔙 پنل", callback_data="self_panel")]
+        ])
     )
 
-    await callback.answer()
+
+@manager.on_callback_query(filters.regex("^lang:"))
+async def lang_cb(client, query):
+    lang = query.data.split(":", 1)[1]
+    settings = await db.settings(query.from_user.id)
+    value = None if settings["translation"] == lang else lang
+    await db.update_setting(query.from_user.id, "translation", value)
+    await safe_answer(query, "Translation OFF" if value is None else f"Translation: {lang}")
+    await self_panel_cb(client, query)
 
 
-@manager_bot.on_callback_query(filters.regex("^copy_card$"))
-async def copy_card_callback(client, callback):
-    # Telegram bots cannot force-copy arbitrary text into the user's clipboard.
-    # Sending the number in a code span makes it easy to long-press/copy.
-    await callback.answer(
-        f"شماره کارت: {CARD_NUMBER}",
-        show_alert=True,
+@manager.on_callback_query(filters.regex("^enemy_list$"))
+async def enemy_list_cb(client, query):
+    rows = await db.list_enemies(query.from_user.id)
+    text = "⚔️ <b>Enemy List</b>\n\n"
+    text += "\n".join(f"• <code>{r['target_id']}</code>" for r in rows) if rows else "لیست خالی است."
+    await safe_answer(query)
+    await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 پنل", callback_data="self_panel")]
+    ]))
+
+
+@manager.on_callback_query(filters.regex("^copy_info$"))
+async def copy_info_cb(client, query):
+    await safe_answer(query)
+    await query.message.edit_text(
+        "👤 <b>Copy Identity</b>\n\n"
+        "برای فعال‌سازی، در SelfBot روی پیام User موردنظر Reply کرده و:\n"
+        "<code>کپی روشن</code>\n\n"
+        "برای Restore:\n<code>کپی خاموش</code>"
     )
 
 
-@manager_bot.on_callback_query(filters.regex(r"^cancel_payment:"))
-async def cancel_payment_callback(client, callback):
-    uid = callback.from_user.id
-    payment_id = int(callback.data.split(":")[1])
-    payment = db.get_payment(payment_id)
-
-    if not payment or int(payment["user_id"]) != uid:
-        await callback.answer("دسترسی غیرمجاز.", show_alert=True)
-        return
-
-    if payment["status"] not in ("pending", "awaiting_receipt"):
-        await callback.answer("این درخواست دیگر قابل لغو نیست.", show_alert=True)
-        return
-
-    with db.connect() as conn:
-        conn.execute("""
-            UPDATE payments
-            SET status='cancelled', reviewed_at=?
-            WHERE id=? AND user_id=?
-        """, (now_iso(), payment_id, uid))
-
-    await callback.message.edit_text("❌ درخواست خرید لغو شد.")
-    await callback.answer()
-
-
-# ============================================================
-# Receipt handler
-# ============================================================
-
-@manager_bot.on_message(filters.photo & filters.private, group=-10)
-async def receipt_handler(client, message: Message):
-    uid = message.from_user.id
-
-    payment = db.get_latest_pending_payment(uid)
-
-    if not payment:
-        return
-
-    payment_id = int(payment["id"])
-    diamonds = int(payment["diamonds"])
-    toman = int(payment["toman"])
-
-    caption = (
-        "🔔 **درخواست تأیید خرید الماس**\n\n"
-        f"🧾 پرداخت: `#{payment_id}`\n"
-        f"👤 کاربر: `{uid}`\n"
-        f"👤 نام: {message.from_user.first_name or '-'}\n"
-        f"🔗 یوزرنیم: @{message.from_user.username or '-'}\n\n"
-        f"💎 مقدار: **{format_number(diamonds)} الماس**\n"
-        f"💰 مبلغ: **{format_number(toman)} تومان**\n\n"
-        "📸 فیش بالا توسط کاربر ارسال شده است."
+@manager.on_callback_query(filters.regex("^buy$"))
+async def buy_cb(client, query):
+    purchase_states[query.from_user.id] = {"value": ""}
+    await safe_answer(query)
+    await query.message.edit_text(
+        "💎 <b>خرید الماس</b>\n\n"
+        f"حداقل خرید: <b>{MIN_DIAMONDS} Diamond</b>\n"
+        f"{DIAMOND_PACK} Diamond = {DIAMOND_PACK_PRICE:,} تومان\n\n"
+        "مقدار Diamond را با دکمه‌ها وارد کنید:",
+        reply_markup=calculator_keyboard("")
     )
 
-    admin_markup = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "✅ تأیید پرداخت",
-                callback_data=f"payapprove:{payment_id}"
-            ),
-            InlineKeyboardButton(
-                "❌ رد پرداخت",
-                callback_data=f"payreject:{payment_id}"
-            ),
-        ],
+
+def calculator_keyboard(value):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("1", callback_data="calc:1"),
+         InlineKeyboardButton("2", callback_data="calc:2"),
+         InlineKeyboardButton("3", callback_data="calc:3")],
+        [InlineKeyboardButton("4", callback_data="calc:4"),
+         InlineKeyboardButton("5", callback_data="calc:5"),
+         InlineKeyboardButton("6", callback_data="calc:6")],
+        [InlineKeyboardButton("7", callback_data="calc:7"),
+         InlineKeyboardButton("8", callback_data="calc:8"),
+         InlineKeyboardButton("9", callback_data="calc:9")],
+        [InlineKeyboardButton("⌫", callback_data="calc:back"),
+         InlineKeyboardButton("0", callback_data="calc:0"),
+         InlineKeyboardButton("❌ حذف", callback_data="calc:clear")],
+        [InlineKeyboardButton("500", callback_data="calc:500"),
+         InlineKeyboardButton("1000", callback_data="calc:1000"),
+         InlineKeyboardButton("1500", callback_data="calc:1500")],
+        [InlineKeyboardButton("2500", callback_data="calc:2500"),
+         InlineKeyboardButton("5000", callback_data="calc:5000")],
+        [InlineKeyboardButton("✅ تأیید", callback_data="calc:confirm")],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data="home")]
     ])
 
-    sent = None
 
-    for admin_id in GOD_ADMIN_IDS:
-        try:
-            sent = await client.send_photo(
-                admin_id,
-                message.photo.file_id,
-                caption=caption,
-                reply_markup=admin_markup,
-            )
-        except Exception as exc:
-            logging.warning(
-                "Could not send receipt to admin %s: %s",
-                admin_id,
-                exc,
-            )
-
-    if not sent:
-        await message.reply_text(
-            "⚠️ ارسال فیش برای ادمین انجام نشد. "
-            "لطفاً بعداً دوباره تلاش کن."
+@manager.on_callback_query(filters.regex("^calc:"))
+async def calc_cb(client, query):
+    uid = query.from_user.id
+    state = purchase_states.setdefault(uid, {"value": ""})
+    action = query.data.split(":", 1)[1]
+    if action == "clear":
+        state["value"] = ""
+    elif action == "back":
+        state["value"] = state["value"][:-1]
+    elif action == "confirm":
+        n = require_int(state["value"])
+        if not n or n < MIN_DIAMONDS:
+            await safe_answer(query, f"حداقل {MIN_DIAMONDS} Diamond", True)
+            return
+        toman = int(amount_toman(n))
+        purchase_states[uid] = {"value": str(n), "confirmed": True}
+        await safe_answer(query)
+        await query.message.edit_text(
+            f"💎 مقدار: <b>{n:,}</b>\n"
+            f"💰 مبلغ: <b>{toman:,} تومان</b>\n\n"
+            f"💳 <b>کارت به کارت</b>\n"
+            f"شماره کارت:\n<code>{CARD_NUMBER}</code>\n"
+            f"صاحب کارت: <b>{CARD_OWNER}</b>\n\n"
+            "پس از پرداخت، عکس فیش را همینجا ارسال کنید.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ لغو", callback_data="buy_cancel")]
+            ])
         )
         return
-
-    db.set_payment_receipt(
-        payment_id,
-        message.photo.file_id,
-        sent.chat.id,
-        sent.id,
-    )
-
-    await message.reply_text(
-        "✅ فیش دریافت شد.\n\n"
-        f"💎 مقدار درخواست: {format_number(diamonds)} الماس\n"
-        f"💰 مبلغ: {format_number(toman)} تومان\n\n"
-        "⏳ فیش برای ادمین ارسال شد.\n"
-        "پس از بررسی، نتیجه برایت ارسال می‌شود."
-    )
-
-
-# ============================================================
-# Admin payment approval
-# ============================================================
-
-@manager_bot.on_callback_query(filters.regex(r"^payapprove:"))
-async def approve_payment_callback(client, callback):
-    admin_id = callback.from_user.id
-
-    if admin_id not in GOD_ADMIN_IDS:
-        await callback.answer("⛔️ دسترسی غیرمجاز.", show_alert=True)
-        return
-
-    payment_id = int(callback.data.split(":")[1])
-    payment = db.get_payment(payment_id)
-
-    if not payment:
-        await callback.answer("پرداخت پیدا نشد.", show_alert=True)
-        return
-
-    try:
-        new_balance = db.approve_payment(payment_id, admin_id)
-
-    except ValueError as exc:
-        await callback.answer(str(exc), show_alert=True)
-        return
-
-    user_id = int(payment["user_id"])
-    diamonds = int(payment["diamonds"])
-
-    try:
-        await client.send_message(
-            user_id,
-            "✅ **پرداخت تأیید شد**\n\n"
-            f"💎 +{format_number(diamonds)} الماس\n"
-            f"💰 موجودی جدید: {format_diamonds(new_balance)} 💎",
-        )
-    except Exception as e:
-        write_detailed_error("Unhandled exception", e)
-
-    try:
-        await callback.message.edit_caption(
-            callback.message.caption
-            + "\n\n✅ **تأیید شد**"
-        )
-    except Exception as e:
-        write_detailed_error("Unhandled exception", e)
-
-    await callback.answer("پرداخت تأیید شد.")
-
-
-@manager_bot.on_callback_query(filters.regex(r"^payreject:"))
-async def reject_payment_callback(client, callback):
-    admin_id = callback.from_user.id
-
-    if admin_id not in GOD_ADMIN_IDS:
-        await callback.answer("⛔️ دسترسی غیرمجاز.", show_alert=True)
-        return
-
-    payment_id = int(callback.data.split(":")[1])
-    payment = db.get_payment(payment_id)
-
-    if not payment:
-        await callback.answer("پرداخت پیدا نشد.", show_alert=True)
-        return
-
-    try:
-        db.reject_payment(payment_id, admin_id)
-    except ValueError as exc:
-        await callback.answer(str(exc), show_alert=True)
-        return
-
-    user_id = int(payment["user_id"])
-
-    try:
-        await client.send_message(
-            user_id,
-            "❌ **فیش پرداخت رد شد.**\n\n"
-            "لطفاً مبلغ و اطلاعات فیش را بررسی کرده و "
-            "در صورت نیاز یک درخواست جدید ایجاد کن.",
-        )
-    except Exception as e:
-        write_detailed_error("Unhandled exception", e)
-
-    try:
-        await callback.message.edit_caption(
-            callback.message.caption
-            + "\n\n❌ **رد شد**"
-        )
-    except Exception as e:
-        write_detailed_error("Unhandled exception", e)
-
-    await callback.answer("پرداخت رد شد.")
-
-
-# ============================================================
-# Referral UI
-# ============================================================
-
-@manager_bot.on_message(
-    filters.regex(r"^👥 دعوت دوستان$") & filters.private
-)
-async def referral_button(client, message):
-    uid = message.from_user.id
-    me = await client.get_me()
-
-    link = f"https://t.me/{me.username}?start=ref_{uid}"
-
-    with db.connect() as conn:
-        total = conn.execute("""
-            SELECT COUNT(*) c
-            FROM referrals
-            WHERE inviter_id=? AND status='verified'
-        """, (uid,)).fetchone()["c"]
-
-        earned = conn.execute("""
-            SELECT COALESCE(SUM(reward), 0) s
-            FROM referrals
-            WHERE inviter_id=? AND status='verified'
-        """, (uid,)).fetchone()["s"]
-
-    await message.reply_text(
-        "👥 **سیستم دعوت HusteRIX**\n\n"
-        f"🔗 لینک اختصاصی:\n`{link}`\n\n"
-        f"👤 رفرال تأییدشده: **{total}**\n"
-        f"💎 درآمد رفرال: **{format_diamonds(earned)} 💎**\n\n"
-        f"🎁 پاداش هر رفرال واقعی +98: **{format_diamonds(REFERRAL_REWARD)} 💎**\n\n"
-        "شرایط:\n"
-        "• شماره باید +98 باشد\n"
-        "• شماره/اکانت قبلاً ثبت نشده باشد\n"
-        "• کاربر باید ورود Userbot را با موفقیت کامل کند",
-    )
-
-
-@manager_bot.on_callback_query(filters.regex("^referral$"))
-async def referral_callback(client, callback):
-    uid = callback.from_user.id
-    me = await client.get_me()
-    link = f"https://t.me/{me.username}?start=ref_{uid}"
-
-    with db.connect() as conn:
-        total = conn.execute("""
-            SELECT COUNT(*) c
-            FROM referrals
-            WHERE inviter_id=? AND status='verified'
-        """, (uid,)).fetchone()["c"]
-
-        earned = conn.execute("""
-            SELECT COALESCE(SUM(reward), 0) s
-            FROM referrals
-            WHERE inviter_id=? AND status='verified'
-        """, (uid,)).fetchone()["s"]
-
-    await callback.message.edit_text(
-        "👥 **رفرال HusteRIX**\n\n"
-        f"🔗 `{link}`\n\n"
-        f"👤 رفرال واقعی: {total}\n"
-        f"💎 درآمد: {format_diamonds(earned)} 💎\n"
-        f"🎁 هر رفرال +98: +{format_diamonds(REFERRAL_REWARD)} 💎"
-    )
-
-
-# ============================================================
-# Transactions
-# ============================================================
-
-@manager_bot.on_message(
-    filters.regex(r"^📜 تراکنش‌ها$") & filters.private
-)
-async def transactions_button(client, message):
-    uid = message.from_user.id
-    rows = db.get_transactions(uid, 15)
-
-    if not rows:
-        await message.reply_text("📜 هنوز تراکنشی ثبت نشده.")
-        return
-
-    lines = ["📜 **تاریخچه Wallet**", ""]
-
-    for row in rows:
-        amount = float(row["amount"])
-        sign = "+" if amount >= 0 else ""
-        lines.append(
-            f"`#{row['id']}` {sign}{format_diamonds(amount)} 💎\n"
-            f"{row['description']}\n"
-        )
-
-    await message.reply_text("\n".join(lines))
-
-
-# ============================================================
-# Activate / restart userbot
-# ============================================================
-
-@manager_bot.on_message(
-    filters.regex(r"^🚀 فعال‌سازی سلف$") & filters.private
-)
-async def activate_self(client, message):
-    uid = message.from_user.id
-    user = db.get_user(uid)
-
-    if not user or not user["session_string"]:
-        await message.reply_text(
-            "❌ ابتدا شماره را ارسال و Userbot را وارد کن."
-        )
-        return
-
-    balance = db.get_balance(uid)
-
-    if balance < HOURLY_COST:
-        await message.reply_text(
-            "❌ موجودی کافی نیست.\n\n"
-            f"💰 موجودی: {format_diamonds(balance)} 💎\n"
-            f"حداقل برای اجرا: {format_diamonds(HOURLY_COST)} 💎"
-        )
-        return
-
-    started = await start_userbot(
-        user["session_string"],
-        user["phone"],
-        uid,
-    )
-
-    if started:
-        await message.reply_text(
-            "🟢 Userbot فعال شد.\n\n"
-            f"💰 موجودی: {format_diamonds(balance)} 💎"
-        )
     else:
-        await message.reply_text("❌ اجرای Userbot ناموفق بود.")
-
-
-# ============================================================
-# Admin panel
-# ============================================================
-
-@manager_bot.on_message(
-    filters.regex(r"^📊 وضعیت ربات$") & filters.private
-)
-async def admin_status(client, message):
-    if message.from_user.id not in GOD_ADMIN_IDS:
-        return
-
-    s = db.get_stats()
-
-    await message.reply_text(
-        "📊 **وضعیت HusteRIX**\n\n"
-        f"👥 کاربران: {s['users']}\n"
-        f"🟢 سلف فعال: {s['active']}\n"
-        f"💎 الماس در گردش: {format_diamonds(s['diamonds'])}\n"
-        f"💳 پرداخت در انتظار: {s['pending']}\n"
-        f"👥 رفرال تأییدشده: {s['referrals']}\n"
-        f"🤖 Userbotهای آنلاین: {len(ACTIVE_BOTS)}"
+        if action.isdigit():
+            if action in {"500", "1000", "1500", "2500", "5000"} and not state["value"]:
+                state["value"] = action
+            else:
+                state["value"] = (state["value"] + action)[:8]
+    display = state["value"] or "0"
+    n = require_int(state["value"])
+    extra = f"\n\n💰 مبلغ: <b>{int(amount_toman(n)):,} تومان</b>" if n else ""
+    await safe_answer(query)
+    await query.message.edit_text(
+        f"💎 مقدار: <b>{display}</b>{extra}",
+        reply_markup=calculator_keyboard(state["value"])
     )
 
 
-@manager_bot.on_message(
-    filters.regex(r"^💳 پرداخت‌های در انتظار$") & filters.private
-)
-async def pending_payments(client, message):
-    if message.from_user.id not in GOD_ADMIN_IDS:
-        return
-
-    with db.connect() as conn:
-        rows = conn.execute("""
-            SELECT *
-            FROM payments
-            WHERE status='awaiting_admin'
-            ORDER BY id ASC
-            LIMIT 30
-        """).fetchall()
-
-    if not rows:
-        await message.reply_text("✅ پرداخت در انتظاری وجود ندارد.")
-        return
-
-    lines = ["💳 **پرداخت‌های در انتظار**", ""]
-
-    for row in rows:
-        lines.append(
-            f"#{row['id']} — User `{row['user_id']}` — "
-            f"{format_number(row['diamonds'])} 💎 — "
-            f"{format_number(row['toman'])} تومان"
-        )
-
-    await message.reply_text("\n".join(lines))
+@manager.on_callback_query(filters.regex("^buy_cancel$"))
+async def buy_cancel_cb(client, query):
+    purchase_states.pop(query.from_user.id, None)
+    await safe_answer(query)
+    await query.message.edit_text("❌ خرید لغو شد.", reply_markup=user_menu())
 
 
-# ============================================================
-# Broadcast
-# ============================================================
-
-@manager_bot.on_message(
-    filters.regex(r"^📢 پیام همگانی$") & filters.private
-)
-async def broadcast_start(client, message):
-    if message.from_user.id not in GOD_ADMIN_IDS:
-        return
-
-    ADMIN_STATES[message.from_user.id] = "broadcast"
-
-    await message.reply_text(
-        "📢 پیام همگانی\n\n"
-        "پیامی که می‌خواهی برای کاربران ارسال شود را بفرست.\n"
-        "برای لغو: `لغو`",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-
-
-@manager_bot.on_message(filters.private, group=20)
-async def broadcast_handler(client, message):
+@manager.on_message(filters.private & filters.photo)
+async def receipt_handler(client, message):
     uid = message.from_user.id
-
-    if uid not in GOD_ADMIN_IDS:
+    state = purchase_states.get(uid)
+    if not state or not state.get("confirmed"):
         return
+    try:
+        diamonds = int(state["value"])
+        toman = int(amount_toman(diamonds))
+        payment_id = await db.create_payment(uid, diamonds, toman)
+        await db.attach_receipt(payment_id, message.photo.file_id)
+        purchase_states.pop(uid, None)
 
-    if ADMIN_STATES.get(uid) != "broadcast":
-        return
-
-    if message.text and message.text.strip() == "لغو":
-        ADMIN_STATES.pop(uid, None)
         await message.reply_text(
-            "❌ لغو شد.",
-            reply_markup=admin_keyboard(),
+            f"🧾 فیش دریافت شد.\n\n"
+            f"Payment ID: <code>{payment_id}</code>\n"
+            f"💎 {diamonds:,} Diamond\n"
+            f"💰 {toman:,} تومان\n\n"
+            "در انتظار بررسی Admin."
         )
+        buttons = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ تأیید پرداخت", callback_data=f"payapprove:{payment_id}")],
+            [InlineKeyboardButton("❌ رد پرداخت", callback_data=f"payreject:{payment_id}")]
+        ])
+        for admin_id in GOD_ADMIN_IDS:
+            try:
+                await manager.send_photo(
+                    admin_id, message.photo.file_id,
+                    caption=(
+                        "💳 <b>Payment Request</b>\n\n"
+                        f"ID: <code>{payment_id}</code>\n"
+                        f"User: <code>{uid}</code>\n"
+                        f"Diamond: <b>{diamonds:,}</b>\n"
+                        f"Amount: <b>{toman:,} تومان</b>"
+                    ),
+                    reply_markup=buttons
+                )
+            except Exception as exc:
+                await send_error_to_db(exc, "notify_admin_payment", uid)
+    except Exception as exc:
+        await send_error_to_db(exc, "receipt_handler", uid)
+        await message.reply_text("❌ ثبت فیش ناموفق بود.")
+
+
+@manager.on_callback_query(filters.regex("^pay(approve|reject):"))
+async def payment_review_cb(client, query):
+    if not is_admin(query.from_user.id):
+        await safe_answer(query, "دسترسی ندارید.", True)
         return
-
-    ADMIN_STATES.pop(uid, None)
-
-    users = db.get_all_users()
-    success = 0
-    failed = 0
-
-    await message.reply_text("⏳ ارسال شروع شد...")
-
-    for row in users:
+    approved = query.data.startswith("payapprove:")
+    pid = query.data.split(":", 1)[1]
+    try:
+        payment, status = await db.review_payment(pid, query.from_user.id, approved)
+        if status == "NOT_FOUND":
+            await safe_answer(query, "Payment پیدا نشد.", True)
+            return
+        if status == "ALREADY_REVIEWED":
+            await safe_answer(query, f"قبلاً {payment['status']} شده.", True)
+            return
+        await db.admin_log(query.from_user.id, f"PAYMENT_{status}", payment["user_id"], pid)
+        if status == "APPROVED":
+            await manager.send_message(
+                payment["user_id"],
+                f"✅ <b>پرداخت شما تأیید شد.</b>\n\n"
+                f"💎 مقدار افزوده‌شده: <b>{payment['diamond_amount']:,} Diamond</b>"
+            )
+        else:
+            await manager.send_message(
+                payment["user_id"],
+                f"❌ <b>پرداخت شما رد شد.</b>\n\nPayment ID: <code>{pid}</code>"
+            )
+        await safe_answer(query, status)
         try:
-            await message.copy(int(row["user_id"]))
-            success += 1
-            await asyncio.sleep(0.05)
+            await query.message.edit_reply_markup(None)
         except Exception:
-            failed += 1
+            pass
+    except Exception as exc:
+        await send_error_to_db(exc, "payment_review_cb", query.from_user.id)
+        await safe_answer(query, "خطا در بررسی پرداخت.", True)
 
-    await message.reply_text(
-        "✅ ارسال تمام شد.\n\n"
-        f"موفق: {success}\n"
-        f"ناموفق: {failed}",
-        reply_markup=admin_keyboard(),
+
+@manager.on_callback_query(filters.regex("^admin_stats$"))
+async def admin_stats_cb(client, query):
+    if not is_admin(query.from_user.id):
+        return
+    try:
+        s = await db.stats()
+        text = (
+            "📊 <b>Statistics</b>\n\n"
+            f"👥 Total Users: {s['users']}\n"
+            f"🤖 Online SelfBots: {len(selfbots)}\n"
+            f"🧩 Total Sessions: {s['sessions']}\n"
+            f"🟢 Active Sessions: {s['active_sessions']}\n"
+            f"💎 Total Diamonds: {s['diamonds']}\n"
+            f"📜 Transactions: {s['transactions']}\n"
+            f"💳 Pending Payments: {s['pending']}\n"
+            f"🎁 Referral Count: {s['referrals']}"
+        )
+        await safe_answer(query)
+        await query.message.edit_text(text, reply_markup=admin_menu())
+    except Exception as exc:
+        await send_error_to_db(exc, "admin_stats_cb", query.from_user.id)
+
+
+@manager.on_callback_query(filters.regex("^admin_sessions$"))
+async def admin_sessions_cb(client, query):
+    if not is_admin(query.from_user.id):
+        return
+    try:
+        rows = await db.all_sessions()
+        lines = ["🤖 <b>Sessions</b>", ""]
+        for r in rows[:30]:
+            lines.append(
+                f"• <code>{r['user_id']}</code> | {safe_text(r['username'], 50)}\n"
+                f"  {r['status']} | {r['phone']} | {r['last_seen'] or '-'}"
+            )
+        if len(rows) > 30:
+            lines.append(f"\n... {len(rows)-30} more")
+        await safe_answer(query)
+        await query.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 Admin", callback_data="admin_home")]
+        ]))
+    except Exception as exc:
+        await send_error_to_db(exc, "admin_sessions_cb", query.from_user.id)
+
+
+@manager.on_callback_query(filters.regex("^admin_users$"))
+async def admin_users_cb(client, query):
+    if not is_admin(query.from_user.id):
+        return
+    try:
+        s = await db.stats()
+        await safe_answer(query)
+        await query.message.edit_text(
+            f"👥 <b>Users</b>\n\nTotal: <b>{s['users']}</b>",
+            reply_markup=admin_menu()
+        )
+    except Exception as exc:
+        await send_error_to_db(exc, "admin_users_cb", query.from_user.id)
+
+
+@manager.on_callback_query(filters.regex("^admin_home$"))
+async def admin_home_cb(client, query):
+    if not is_admin(query.from_user.id):
+        return
+    await safe_answer(query)
+    await query.message.edit_text("🛡 <b>HusteRIX Admin</b>", reply_markup=admin_menu())
+
+
+@manager.on_callback_query(filters.regex("^admin_logs$"))
+async def admin_logs_cb(client, query):
+    if not is_admin(query.from_user.id):
+        return
+    try:
+        rows = await db.recent_errors(8)
+        text = "📋 <b>آخرین خطاها</b>\n\n"
+        if not rows:
+            text += "هیچ خطایی ثبت نشده."
+        for r in rows:
+            text += (
+                f"#{r['id']} | {r['level']} | {r['module']}\n"
+                f"{safe_text(r['exception_type'])}: {safe_text(r['exception_message'], 250)}\n"
+                f"{r['created_at'][:19]}\n\n"
+            )
+        await safe_answer(query)
+        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Refresh", callback_data="admin_logs")],
+            [InlineKeyboardButton("🗑 Clear Logs", callback_data="admin_clear_logs")],
+            [InlineKeyboardButton("🔙 Admin", callback_data="admin_home")]
+        ]))
+    except Exception as exc:
+        await send_error_to_db(exc, "admin_logs_cb", query.from_user.id)
+
+
+@manager.on_callback_query(filters.regex("^admin_clear_logs$"))
+async def admin_clear_logs_cb(client, query):
+    if not is_admin(query.from_user.id):
+        return
+    await db.clear_errors()
+    await db.admin_log(query.from_user.id, "CLEAR_ERROR_LOGS")
+    await safe_answer(query, "Logs پاک شد.")
+    await admin_logs_cb(client, query)
+
+
+@manager.on_callback_query(filters.regex("^admin_ban$"))
+async def admin_ban_cb(client, query):
+    if not is_admin(query.from_user.id):
+        return
+    broadcast_states[query.from_user.id] = {"type": "ban"}
+    await safe_answer(query)
+    await query.message.edit_text(
+        "🚫 User ID را برای Ban ارسال کنید.\n"
+        "برای Unban از <code>/unban USER_ID</code> استفاده کنید."
     )
 
 
-# ============================================================
-# Auto restart monitor
-# ============================================================
+@manager.on_message(filters.command("unban"))
+async def unban_cmd(client, message):
+    if not is_admin(message.from_user.id):
+        return
+    if len(message.command) < 2:
+        return
+    uid = require_int(message.command[1])
+    if uid:
+        await db.set_banned(uid, False)
+        await db.admin_log(message.from_user.id, "UNBAN", uid)
+        await message.reply_text("✅ Unban شد.")
 
-async def userbot_monitor():
-    while True:
-        try:
-            users = db.get_all_users()
 
-            for row in users:
-                uid = int(row["user_id"])
+@manager.on_callback_query(filters.regex("^admin_remove_session$"))
+async def admin_remove_session_cb(client, query):
+    if not is_admin(query.from_user.id):
+        return
+    broadcast_states[query.from_user.id] = {"type": "remove_session"}
+    await safe_answer(query)
+    await query.message.edit_text("🗑 User ID مربوط به Session را ارسال کنید.")
 
-                if uid in ACTIVE_BOTS:
-                    continue
 
-                sub = db.get_subscription(uid)
+@manager.on_callback_query(filters.regex("^admin_wallet$"))
+async def admin_wallet_cb(client, query):
+    if not is_admin(query.from_user.id):
+        return
+    broadcast_states[query.from_user.id] = {"type": "wallet"}
+    await safe_answer(query)
+    await query.message.edit_text(
+        "💎 Wallet Control\n"
+        "فرمت:\n<code>USER_ID +100</code>\n"
+        "یا\n<code>USER_ID -50</code>"
+    )
 
-                if not sub or not sub["active"]:
-                    continue
 
-                session_string = row["session_string"]
-                phone = row["phone"]
+@manager.on_callback_query(filters.regex("^admin_broadcast$"))
+async def admin_broadcast_cb(client, query):
+    if not is_admin(query.from_user.id):
+        return
+    broadcast_states[query.from_user.id] = {"type": "broadcast"}
+    await safe_answer(query)
+    await query.message.edit_text("📢 متن Broadcast را ارسال کنید.")
 
-                if not session_string:
-                    continue
 
-                if db.get_balance(uid) < HOURLY_COST:
-                    db.stop_subscription(uid)
-                    continue
-
-                logging.info(
-                    "Attempting auto restart for userbot %s",
-                    uid
+@manager.on_callback_query(filters.regex("^admin_payments$"))
+async def admin_payments_cb(client, query):
+    if not is_admin(query.from_user.id):
+        return
+    try:
+        rows = await db.run(lambda c: c.execute("""
+            SELECT * FROM payments WHERE status='PENDING'
+            ORDER BY created_at LIMIT 20
+        """).fetchall())
+        text = "💳 <b>Pending Payments</b>\n\n"
+        if not rows:
+            text += "موردی وجود ندارد."
+        else:
+            for p in rows:
+                text += (
+                    f"• <code>{p['payment_id']}</code>\n"
+                    f"User: {p['user_id']} | {p['diamond_amount']} 💎 | "
+                    f"{p['amount_toman']:,} تومان\n\n"
                 )
-
-                await start_userbot(
-                    session_string,
-                    phone,
-                    uid,
-                )
-
-            await asyncio.sleep(60)
-
-        except Exception as exc:
-            logging.exception("Monitor error: %s", exc)
-            await asyncio.sleep(60)
+        await safe_answer(query)
+        await query.message.edit_text(text, reply_markup=admin_menu())
+    except Exception as exc:
+        await send_error_to_db(exc, "admin_payments_cb", query.from_user.id)
 
 
-# ============================================================
-# Main
-# ============================================================
+async def handle_broadcast_input(message, state):
+    uid = message.from_user.id
+    typ = state["type"]
+    text = message.text or ""
+    broadcast_states.pop(uid, None)
 
-async def restore_userbots():
-    rows = db.get_all_users()
-
-    for row in rows:
-        uid = int(row["user_id"])
-
-        if not row["session_string"]:
-            continue
-
-        sub = db.get_subscription(uid)
-
-        if not sub or not sub["active"]:
-            continue
-
-        if db.get_balance(uid) < HOURLY_COST:
-            db.stop_subscription(uid)
-            continue
-
-        await start_userbot(
-            row["session_string"],
-            row["phone"],
-            uid,
+    if typ == "broadcast":
+        ids = await db.all_user_ids()
+        success = failed = 0
+        for target in ids:
+            try:
+                await manager.send_message(target, text)
+                success += 1
+            except FloodWait as e:
+                await asyncio.sleep(min(e.value, 60))
+                try:
+                    await manager.send_message(target, text)
+                    success += 1
+                except Exception:
+                    failed += 1
+            except Exception:
+                failed += 1
+            await asyncio.sleep(0.04)
+        bid = await db.run(lambda c: c.execute("""
+            INSERT INTO broadcasts(admin_id,text,success,failed,created_at)
+            VALUES(?,?,?,?,?)
+        """, (uid, text, success, failed, now_iso())).lastrowid)
+        await db.admin_log(uid, "BROADCAST", details=f"id={bid}, success={success}, failed={failed}")
+        await message.reply_text(
+            f"📢 Broadcast تمام شد.\n\n✅ موفق: {success}\n❌ ناموفق: {failed}"
         )
+
+    elif typ == "ban":
+        target = require_int(text)
+        if target:
+            await db.set_banned(target, True)
+            await stop_selfbot(target)
+            await db.admin_log(uid, "BAN", target)
+            await message.reply_text("🚫 User Ban شد.")
+        else:
+            await message.reply_text("❌ User ID نامعتبر است.")
+
+    elif typ == "remove_session":
+        target = require_int(text)
+        if target:
+            await stop_selfbot(target, remove=True)
+            await db.admin_log(uid, "REMOVE_SESSION", target)
+            await message.reply_text("🗑 Session حذف شد.")
+        else:
+            await message.reply_text("❌ User ID نامعتبر است.")
+
+    elif typ == "wallet":
+        parts = text.split()
+        if len(parts) != 2:
+            await message.reply_text("فرمت: USER_ID +100")
+            return
+        target = require_int(parts[0])
+        try:
+            amount = Decimal(parts[1])
+        except InvalidOperation:
+            amount = None
+        if target is None or amount is None or amount == 0:
+            await message.reply_text("❌ ورودی نامعتبر.")
+            return
+        ok, balance = await db.wallet_change(
+            target, amount,
+            "ADMIN_ADD" if amount > 0 else "ADMIN_REMOVE",
+            f"Admin {uid}"
+        )
+        if ok:
+            await db.admin_log(uid, "WALLET_CHANGE", target, str(amount))
+            await message.reply_text(f"✅ انجام شد. Balance: {fmt_diamond(balance)}")
+            try:
+                await manager.send_message(
+                    target,
+                    f"💎 Wallet تغییر کرد.\nمقدار: {fmt_diamond(amount)}\n"
+                    f"موجودی: {fmt_diamond(balance)}"
+                )
+            except Exception:
+                pass
+        else:
+            await message.reply_text("❌ موجودی کافی نیست.")
+
+
+async def restore_sessions():
+    rows = await db.all_sessions()
+    for row in rows:
+        try:
+            user = await db.get_user(row["user_id"])
+            if not user or user["is_banned"]:
+                await db.update_session(row["session_id"], status="STOPPED")
+                continue
+            ok = await start_selfbot(row["user_id"])
+            if ok:
+                # handlers must be registered after start; Pyrogram supports add_handler.
+                await configure_selfbot_handlers(row["user_id"], selfbots[row["user_id"]])
+        except Exception as exc:
+            await send_error_to_db(exc, "restore_sessions", row["user_id"], row["session_id"])
+
+
+async def session_bootstrap():
+    # Called after manager starts.
+    rows = await db.all_sessions()
+    for row in rows:
+        try:
+            user = await db.get_user(row["user_id"])
+            if user and not user["is_banned"]:
+                await start_selfbot(row["user_id"])
+        except Exception as exc:
+            await send_error_to_db(exc, "session_bootstrap", row["user_id"], row["session_id"])
+
+
+@manager.on_message(filters.command("adminpanel"))
+async def adminpanel_cmd(client, message):
+    if is_admin(message.from_user.id):
+        await message.reply_text("🛡 <b>Admin Panel</b>", reply_markup=admin_menu())
+
+
+@manager.on_message(filters.command("stopself"))
+async def stopself_cmd(client, message):
+    if not is_admin(message.from_user.id):
+        return
+    if len(message.command) < 2:
+        return
+    uid = require_int(message.command[1])
+    if uid:
+        await stop_selfbot(uid)
+        await db.admin_log(message.from_user.id, "STOP_SESSION", uid)
+        await message.reply_text("⏹ Session متوقف شد.")
+
+
+@manager.on_message(filters.command("startself"))
+async def startself_cmd(client, message):
+    if not is_admin(message.from_user.id):
+        return
+    if len(message.command) < 2:
+        return
+    uid = require_int(message.command[1])
+    if uid:
+        ok = await start_selfbot(uid)
+        # start_selfbot registers the handlers itself.
+        await db.admin_log(message.from_user.id, "START_SESSION", uid)
+        await message.reply_text("▶️ Session اجرا شد." if ok else "❌ اجرا نشد.")
+
+
+async def shutdown():
+    for uid in list(selfbots):
+        try:
+            await stop_selfbot(uid)
+        except Exception as exc:
+            await send_error_to_db(exc, "shutdown", uid)
+    try:
+        await manager.stop()
+    except Exception:
+        pass
 
 
 async def main():
-    logging.info("Starting HusteRIX...")
+    await db.init()
+    await manager.start()
+    me = await manager.get_me()
+    global BOT_USERNAME
+    BOT_USERNAME = BOT_USERNAME or (me.username or "")
+    logger.info("%s started as @%s", APP_NAME, me.username)
 
-    await manager_bot.start()
+    await session_bootstrap()
 
-    logging.info("Manager bot started.")
-
-    await restore_userbots()
-
-    asyncio.create_task(charge_loop())
-    asyncio.create_task(userbot_monitor())
-
-    logging.info("HusteRIX is online.")
-
-    await idle()
-
-    for uid in list(ACTIVE_BOTS.keys()):
-        await stop_userbot(uid)
-
-    await manager_bot.stop()
+    try:
+        await asyncio.Event().wait()
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        await shutdown()
 
 
 if __name__ == "__main__":
-    logging.info("HusteRIX process starting...")
-
     try:
         asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    except Exception as exc:
+        log_exception("FATAL application error", exc=exc)
+        raise
