@@ -78,14 +78,12 @@ def env_required(name: str) -> str:
     return value
 
 
-API_ID = int(env_required("API_ID"))
-API_HASH = env_required("API_HASH")
-BOT_TOKEN = env_required("BOT_TOKEN")
+API_ID = 32955870
+API_HASH = "a40ba705a967c3c8e490f4684f42256a"
+BOT_TOKEN = "8432783132:AAFNapmFYrIcRGnHN7Cnp25KZTlUvOSUwZA"
 
 GOD_ADMIN_IDS = {
-    int(x.strip())
-    for x in os.getenv("GOD_ADMIN_IDS", "").split(",")
-    if x.strip().isdigit()
+    7727625618
 }
 
 DB_FILE = os.getenv("DB_FILE", "husterix.sqlite3")
