@@ -159,6 +159,20 @@ class ContextFilter(logging.Filter):
 
 logger.addFilter(ContextFilter())
 
+# ============================================================
+# TEMP DEBUG MODE
+# This build prints incoming Telegram messages and handler
+# milestones to the terminal. Set DEBUG_MODE = False later.
+# ============================================================
+DEBUG_MODE = True
+
+def debug_log(event, **data):
+    if not DEBUG_MODE:
+        return
+    details = " | ".join(f"{k}={safe_text(v, 500)!r}" for k, v in data.items())
+    logger.info("[DEBUG] %s%s", event, f" | {details}" if details else "")
+
+
 
 def log_exception(message, *, user_id=None, session_id=None, exc=None, level=logging.ERROR):
     if exc is None:
@@ -865,21 +879,73 @@ async def home_message(message):
     await message.reply_text(text, reply_markup=user_menu())
 
 
+@manager.on_message(filters.private, group=-1000)
+async def debug_incoming_message(client, message):
+    # Temporary first-line diagnostic handler.
+    # It never replies, edits, deletes, or stops propagation.
+    try:
+        u = message.from_user
+        incoming_text = getattr(message, "text", None)
+        # Do not print phone numbers, login codes, passwords, or normal user
+        # messages to the terminal. Commands such as /start are safe to show.
+        safe_incoming_text = (
+            incoming_text if isinstance(incoming_text, str) and incoming_text.startswith("/")
+            else "<redacted non-command text>"
+        )
+        debug_log(
+            "INCOMING_MESSAGE_RECEIVED",
+            user_id=getattr(u, "id", None),
+            username=getattr(u, "username", None),
+            first_name=getattr(u, "first_name", None),
+            chat_id=getattr(message.chat, "id", None),
+            message_id=getattr(message, "id", None),
+            text=safe_incoming_text,
+            command=getattr(message, "command", None),
+            service=getattr(message, "service", None),
+        )
+    except Exception as exc:
+        logger.exception("[DEBUG] debug_incoming_message failed: %s", exc)
+
 @manager.on_message(filters.private & filters.command("start"), group=-10)
 async def start_handler(client, message):
+    uid = message.from_user.id if message.from_user else None
     try:
-        logger.info("Received /start from user_id=%s", message.from_user.id if message.from_user else "-")
+        debug_log(
+            "START_HANDLER_ENTER",
+            user_id=uid,
+            chat_id=getattr(message.chat, "id", None),
+            message_id=getattr(message, "id", None),
+            text=getattr(message, "text", None),
+            command=getattr(message, "command", None),
+        )
+
+        debug_log("START_STEP", step="ensure_manager_user", user_id=uid)
         await ensure_manager_user(client, message)
+        debug_log("START_STEP_OK", step="ensure_manager_user", user_id=uid)
+
         ref = None
         if len(message.command) > 1:
             ref = require_int(message.command[1].replace("ref_", ""))
-        if ref and ref != message.from_user.id:
+            debug_log("START_REF", user_id=uid, ref=ref)
+
+        if ref and ref != uid:
+            debug_log("START_STEP", step="referral_lookup", user_id=uid, ref=ref)
             ref_user = await db.get_user(ref)
             if ref_user:
-                await db.referral_create(message.from_user.id, None, ref)
+                await db.referral_create(uid, None, ref)
+                debug_log("START_STEP_OK", step="referral_create", user_id=uid, ref=ref)
+
+        debug_log("START_STEP", step="home_message", user_id=uid)
         await home_message(message)
+        debug_log("START_HANDLER_SUCCESS", user_id=uid)
     except Exception as exc:
-        await send_error_to_db(exc, "start_handler", message.from_user.id)
+        debug_log(
+            "START_HANDLER_ERROR",
+            user_id=uid,
+            exception_type=type(exc).__name__,
+            exception=str(exc),
+        )
+        await send_error_to_db(exc, "start_handler", uid)
 
 
 @manager.on_message(filters.command("admin"))
@@ -2161,7 +2227,9 @@ async def main():
     loop.set_exception_handler(_loop_exception_handler)
     await db.init()
     logger.info("Initializing HusteRIX manager bot...")
+    debug_log("BOOT_STEP", step="manager.start", status="BEGIN")
     await manager.start()
+    debug_log("BOOT_STEP_OK", step="manager.start", status="DONE")
     me = await manager.get_me()
     global BOT_USERNAME
     BOT_USERNAME = BOT_USERNAME or (me.username or "")
@@ -2170,12 +2238,32 @@ async def main():
         raise RuntimeError("Manager client authenticated, but the account is not a bot")
 
     logger.info("Manager connection established as @%s", me.username or me.id)
-    logger.info("Manager message handlers registered: %d", sum(len(g) for g in manager.dispatcher.groups.values()))
+    handler_count = sum(len(g) for g in manager.dispatcher.groups.values())
+    logger.info("Manager message handlers registered: %d", handler_count)
+    debug_log(
+        "DISPATCHER_READY",
+        handler_count=handler_count,
+        groups=sorted(manager.dispatcher.groups.keys()),
+        bot_username=me.username,
+        bot_id=me.id,
+    )
+    for group_id, group_handlers in sorted(manager.dispatcher.groups.items(), key=lambda x: x[0]):
+        debug_log(
+            "HANDLER_GROUP",
+            group=group_id,
+            count=len(group_handlers),
+            handlers=[type(h).__name__ for h in group_handlers],
+        )
     logger.info("HusteRIX started successfully as @%s", me.username or me.id)
+    debug_log(
+        "READY_FOR_TEST",
+        message="حالا دکمه /start را بزن؛ باید INCOMING_MESSAGE_RECEIVED و بعد START_HANDLER_ENTER را ببینی."
+    )
 
     await session_bootstrap()
     logger.info("Session bootstrap completed")
 
+    debug_log("MAIN_LOOP_ENTER", message="Bot is waiting for Telegram updates.")
     try:
         await asyncio.Event().wait()
     except (KeyboardInterrupt, SystemExit):
