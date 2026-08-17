@@ -78,6 +78,7 @@ def env_required(name: str) -> str:
     return value
 
 
+# Production credentials/config supplied for this deployment.
 API_ID = 32955870
 API_HASH = "a40ba705a967c3c8e490f4684f42256a"
 BOT_TOKEN = "8432783132:AAHaNXKf_JQNQ8maiV_y2fF_efVUOVZiB2A"
@@ -86,15 +87,6 @@ GOD_ADMIN_IDS = {
     7727625618
 }
 
-DB_FILE = "husterix.sqlite3"
-
-CARD_NUMBER = "5022291579049451"
-CARD_OWNER = "علی محمدی پور"
-
-DIAMOND_MIN = 500
-DIAMOND_PER_500 = 20000
-HOURLY_COST = 2.5
-REFERRAL_REWARD = 25
 DB_FILE = os.getenv("DB_FILE", "husterix.sqlite3")
 
 CARD_NUMBER = os.getenv("CARD_NUMBER", "5022291579049451")
