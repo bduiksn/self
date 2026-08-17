@@ -71,11 +71,12 @@ APP_NAME = "HusteRIX"
 DB_PATH = "husterix.sqlite3"
 LOG_PATH = "husterix_errors.log"
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-API_ID = int(os.getenv("API_ID", "0") or 0)
-API_HASH = os.getenv("API_HASH", "").strip()
+# HusteRIX Telegram credentials
+BOT_TOKEN = "8432783132:AAHaNXKf_JQNQ8maiV_y2fF_efVUOVZiB2A"
+API_ID = 32955870
+API_HASH = "a40ba705a967c3c8e490f4684f42256a"
 
-BOT_USERNAME = ""
+BOT_USERNAME = "Huste_TestCodebot"
 CARD_NUMBER = "5022291579049451"
 CARD_OWNER = "علی محمدی پور"
 
